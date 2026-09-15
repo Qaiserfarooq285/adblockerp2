@@ -36,6 +36,7 @@ def main() -> int:
     ap.add_argument("--out", default=str(ROOT / "data" / "dataset"))
     ap.add_argument("--val-frac", type=float, default=0.22)
     ap.add_argument("--synth", default=str(ROOT / "data" / "synth" / "manifest.json"))
+    ap.add_argument("--external", default=str(ROOT / "data" / "external" / "manifest.json"))
     args = ap.parse_args()
 
     manifest = json.loads(Path(args.manifest).read_text())
@@ -75,12 +76,33 @@ def main() -> int:
         by_match["__synthetic__"] = syn
         print(f"synthetic (train only): {len(syn)} images")
 
+    # External (Roboflow) real broadcast images.  Also train-only, for the
+    # same reason as synthetic: val measures generalisation to whole unseen
+    # matches from OUR footage, and mixing in a different broadcaster/league
+    # would change what that number means and make it incomparable with every
+    # earlier training run's val score.
+    ext_path = Path(args.external)
+    if ext_path.exists():
+        ext = json.loads(ext_path.read_text())
+        by_match["__external__"] = ext
+        print(f"external real footage (train only): {len(ext)} images")
+
     counts = {"train": [0, 0, 0], "val": [0, 0, 0]}   # images, polys, negatives
     for mk, items in by_match.items():
         split = "val" if mk in val_matches else "train"
         for m in items:
             src = Path(m["image"])
-            name = f"{src.parent.name}_{src.stem}"
+            if mk in ("__synthetic__", "__external__"):
+                # These all live under a directory literally named "images",
+                # so parent.name alone collides across sources (both Roboflow
+                # sets use identical Roboflow-style folder layouts).  A path
+                # hash guarantees uniqueness instead of silently overwriting
+                # one image's label file with another's.
+                import hashlib
+                h = hashlib.sha1(str(src).encode()).hexdigest()[:10]
+                name = f"{mk.strip('_')}_{h}_{src.stem}"[:120]
+            else:
+                name = f"{src.parent.name}_{src.stem}"
             dst_img = out / "images" / split / f"{name}.jpg"
             if not dst_img.exists():
                 try:

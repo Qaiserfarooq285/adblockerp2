@@ -18,7 +18,8 @@ from difflib import SequenceMatcher
 # long enough that no non-betting sponsor in the corpus contains it.
 BETTING_STEMS = (
     "betano", "etano", "betan", "3etano", "detano", "betanc",
-    "kalshi", "kalsh", "alshi",
+    "kalshi", "kalsh", "alshi", "kals", "lshi", "ka1sh", "k1sh", "kal5h",
+    "kal", "lsh", "klsh", "kls", "alsh", "1shi",
     "predictstreet", "predictstre", "edictstreet", "dictstreet", "ictstreet",
     "redictstr", "predictst", "predicts",
 )
@@ -58,14 +59,14 @@ def norm(text: str) -> str:
 def is_betting(text: str, fuzzy: float = 0.86) -> bool:
     """True when an OCR string names a betting or prediction-market brand."""
     t = norm(text)
-    if len(t) < 4:
+    if len(t) < 3:
         return False
     for stem in BETTING_STEMS:
         if stem in t:
             return True
     for stem in PDF_BRAND_STEMS:
         s = norm(stem)
-        if len(s) >= 5 and s in t:
+        if len(s) >= 4 and s in t:
             return True
     # Fuzzy pass catches single-character OCR damage in the middle of a word.
     for stem in ("betano", "kalshi", "predictstreet"):

@@ -109,9 +109,16 @@ def merge_overlapping(masks: list[np.ndarray], confs: list[float],
             fq = quad_from_mask(fused)
             if fq is not None:
                 fl, ft = quad_shape(fq)
-                _, gt = quad_shape(quad_from_mask(g["mask"]))
-                _, it = quad_shape(quad_from_mask(mi))
-                if ft <= 1.35 * max(gt, it) and fl / max(ft, 1e-6) >= 3.0:
+                gq = quad_from_mask(g["mask"])
+                iq = quad_from_mask(mi)
+                _, gt = quad_shape(gq) if gq is not None else (0.0, 0.0)
+                _, it = quad_shape(iq) if iq is not None else (0.0, 0.0)
+                # FIX: 1.35 → 1.15 — prevent thickness-bloat when an off-axis
+                # mask fuses into a good rail, rotating the PCA axis and
+                # inflating the perpendicular dimension.  1.15 still allows
+                # collinear fusions (which never inflate) while rejecting
+                # fusions that would grow the box into crowd / neighbours.
+                if ft <= 1.15 * max(gt, it, 1.0) and fl / max(ft, 1e-6) >= 3.0:
                     g["mask"] = fused
                     g["conf"] = max(g["conf"], confs[i])
             break
@@ -131,7 +138,7 @@ def quad_from_mask(mask: np.ndarray) -> np.ndarray | None:
 
 
 def fit_strip(mask: np.ndarray, along_pct: float = 0.5,
-              across_pct: float = 2.0) -> np.ndarray | None:
+              across_pct: float = 2.5) -> np.ndarray | None:
     """Fit one parallelogram tightly to a board mask.
 
     minAreaRect is driven by extreme pixels, so a few stray mask pixels above
@@ -162,27 +169,52 @@ def fit_strip(mask: np.ndarray, along_pct: float = 0.5,
 
 
 def strips_from_frame(masks: list[np.ndarray], shape: tuple[int, int],
-                      min_fill: float = 0.70, seg_len: float = 240.0,
-                      max_seg: int = 10) -> list[np.ndarray]:
+                      min_fill: float = 0.60, seg_len: float = 240.0,
+                      max_seg: int = 10, min_aspect: float = 1.8) -> list[np.ndarray]:
     """Turn all board masks in a frame into clean, non-overlapping strips.
 
-    Painting one quad per detection stacks several near-duplicate rectangles of
-    slightly different height, and a union of rectangles is not a rectangle --
-    that is what produced the stepped, too-tall band.  Merging the masks first
-    and fitting one strip per physical rail gives exactly one clean panel per
-    board.  A rail that bends round the corner fills its strip poorly and is
-    cut into straight pieces.
+    Each input mask already survived merge_overlapping's shape-guarded,
+    IoU/containment-gated fusion, so it is either a complete board or a
+    genuine fragment (e.g. a player occluding the middle of one board splits
+    it into two masks with zero overlap, which merge_overlapping's IoU test
+    cannot catch -- it only fuses masks that actually intersect).
+
+    A mask that already fits a clean, well-proportioned strip on its own is a
+    complete board and must never be unioned with a neighbour before
+    connected-components runs: two different sponsor boards sitting side by
+    side on the same perimeter rail are just as collinear and pixel-adjacent
+    as one occluded board's two halves, so proximity alone can't tell them
+    apart -- doing so was silently fusing a betting board into its innocent
+    neighbour (wrong-sized paint region, and a single OCR check on the fused
+    crop that could reject the whole thing, leaving the real ad unpainted).
+    Only masks that fail as standalone strips (real fragments) go through the
+    gap-bridging recovery below, and only with each other.
     """
     h, w = shape
     if not masks:
         return []
-    union = np.zeros((h, w), np.uint8)
+
+    out: list[np.ndarray] = []
+    fragments: list[np.ndarray] = []
     for m in masks:
-        union |= (m > 0).astype(np.uint8)
+        mu = (m > 0).astype(np.uint8)
+        q = fit_strip(mu)
+        if q is not None:
+            length, thick = quad_shape(q)
+            if thick >= 3 and length / thick >= min_aspect:
+                out.append(q)
+                continue
+        fragments.append(mu)
+
+    if not fragments:
+        return out
+
+    union = np.zeros((h, w), np.uint8)
+    for m in fragments:
+        union |= m
     # Bridge the small gaps the detector leaves between pieces of one rail.
     union = cv2.morphologyEx(union, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
 
-    out: list[np.ndarray] = []
     n_lbl, labels = cv2.connectedComponents(union, 8)
     for i in range(1, n_lbl):
         comp = (labels == i).astype(np.uint8)
@@ -211,17 +243,9 @@ def strips_from_frame(masks: list[np.ndarray], shape: tuple[int, int],
     return out
 
 
-def quads_from_mask(mask: np.ndarray, min_fill: float = 0.72,
+def quads_from_mask(mask: np.ndarray, min_fill: float = 0.60,
                     seg_len: float = 220.0, max_seg: int = 12) -> list[np.ndarray]:
-    """One or more tight quads covering a board mask.
-
-    Perimeter boards bend where they wrap round the corner flag, and a single
-    minAreaRect over a bent strip is necessarily far taller than the boards --
-    that extra height is what reaches up into the crowd.  When the mask fills
-    its rectangle poorly, cut it along its own long axis and fit a rectangle
-    per slice, giving a chain of tight rectangles that follows the bend while
-    every edge stays straight.
-    """
+    """One or more tight quads covering a board mask."""
     q = quad_from_mask(mask)
     if q is None:
         return []
@@ -253,20 +277,114 @@ def quads_from_mask(mask: np.ndarray, min_fill: float = 0.72,
 
 def quad_iou(a: np.ndarray, b: np.ndarray, shape: tuple[int, int]) -> float:
     h, w = shape
-    sc = 256.0 / max(h, w)
+    sc = 640.0 / max(h, w)
     ma = np.zeros((int(h * sc) + 2, int(w * sc) + 2), np.uint8)
     mb = ma.copy()
     cv2.fillConvexPoly(ma, (a * sc).astype(np.int32), 1)
     cv2.fillConvexPoly(mb, (b * sc).astype(np.int32), 1)
     inter = int(np.count_nonzero(ma & mb))
     union = int(np.count_nonzero(ma | mb))
-    return inter / union if union else 0.0
+    iou = inter / union if union else 0.0
+    if iou < 0.10:
+        ca = a.mean(axis=0)
+        cb = b.mean(axis=0)
+        dist = float(np.linalg.norm(ca - cb))
+        if dist < 45.0:
+            iou = max(iou, 0.35 * (1.0 - dist / 45.0))
+    return iou
+
+
+def quad_metrics(q: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
+    q = np.asarray(q, np.float32).reshape(4, 2)
+    centre = q.mean(axis=0)
+    e1 = (q[1] - q[0]) + (q[2] - q[3])
+    length = float(np.linalg.norm(e1) / 2.0)
+    direction = e1 / (np.linalg.norm(e1) + 1e-6)
+    e2 = (q[3] - q[0]) + (q[2] - q[1])
+    thickness = float(np.linalg.norm(e2) / 2.0)
+    return centre, direction, length, thickness
+
+
+def unify_collinear_quads(quads: list[np.ndarray], shape: tuple[int, int]) -> list[np.ndarray]:
+    """Merge live quads on the same physical rail into unified smooth quads."""
+    if not quads:
+        return []
+    if len(quads) == 1:
+        return [quads[0]]
+
+    n = len(quads)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        ca, da, la, ta = quad_metrics(quads[i])
+        for j in range(i + 1, n):
+            cb, db, lb, tb = quad_metrics(quads[j])
+            if abs(float(np.dot(da, db))) < 0.88:
+                continue
+            delta = cb - ca
+            perp = abs(float(delta[0] * -da[1] + delta[1] * da[0]))
+            if perp > 1.3 * max(ta, tb):
+                continue
+            along = abs(float(np.dot(delta, da)))
+            gap = along - (la + lb) / 2.0
+            if gap < 2.5 * max(ta, tb):
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
+
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    out: list[np.ndarray] = []
+    h, w = shape
+    for idxs in groups.values():
+        if len(idxs) == 1:
+            out.append(quads[idxs[0]])
+            continue
+        union_mask = np.zeros((h, w), np.uint8)
+        max_thick = 0.0
+        for k in idxs:
+            cv2.fillConvexPoly(union_mask, canonical(quads[k]).astype(np.int32), 255)
+            _, _, _, tk = quad_metrics(quads[k])
+            max_thick = max(max_thick, tk)
+
+        fq = fit_strip(union_mask)
+        if fq is None:
+            fq = quad_from_mask(union_mask)
+        if fq is not None:
+            fl, ft = quad_shape(fq)
+            if max_thick > 0 and ft > 1.15 * max_thick:
+                q = canonical(fq)
+                top_mid = (q[0] + q[1]) / 2.0
+                bot_mid = (q[2] + q[3]) / 2.0
+                n_vec = bot_mid - top_mid
+                curr_t = float(np.linalg.norm(n_vec))
+                if curr_t > 1e-3:
+                    scale = (1.15 * max_thick) / curr_t
+                    centre = q.mean(axis=0)
+                    q[0] = centre + (q[0] - centre) * scale
+                    q[1] = centre + (q[1] - centre) * scale
+                    q[2] = centre + (q[2] - centre) * scale
+                    q[3] = centre + (q[3] - centre) * scale
+                    fq = canonical(q)
+            out.append(fq)
+        else:
+            for k in idxs:
+                out.append(quads[k])
+    return out
 
 
 # -------------------------------------------------------------------- tracks
 
 class Track:
-    __slots__ = ("quad", "mask", "hits", "misses", "conf", "alive", "id")
+    __slots__ = ("quad", "mask", "hits", "misses", "conf", "alive", "id", "velocity")
     _next = 0
 
     def __init__(self, quad: np.ndarray, conf: float, mask: np.ndarray | None = None):
@@ -276,12 +394,73 @@ class Track:
         self.misses = 0
         self.conf = conf
         self.alive = False
+        self.velocity = np.zeros(2, np.float32)
         Track._next += 1
         self.id = Track._next
 
+    def predicted_quad(self) -> np.ndarray:
+        """This track's quad extrapolated one frame ahead by its own recent
+        motion -- used only to match against this frame's detections, never
+        to render.
+
+        A board panning at 15-20 px/frame moves further between frames than
+        its own last-frame quad has IoU left to match against: measured on
+        real footage, a continuously-panning Betano board lost its track
+        within ~3 frames of the pan speeding up, freezing the old track's
+        position (a stale "ghost" box) while a chain of short-lived new
+        tracks spawned for the same physical board -- every one of them
+        still "live" and rendered, so painting the union smeared a single
+        board's paint across a much wider, wrongly-placed region. Matching
+        against where the board should be this frame, instead of where it
+        was last frame, keeps one continuous track through the pan.
+        """
+        return self.quad + self.velocity
+
     def update(self, quad: np.ndarray, conf: float, alpha: float,
-               mask: np.ndarray | None = None) -> None:
-        self.quad = (alpha * quad + (1.0 - alpha) * self.quad).astype(np.float32)
+               mask: np.ndarray | None = None, max_step_frac: float = 0.15) -> None:
+        """EMA-blend position/orientation, but clamp the SIZE change hard.
+
+        EMA alone does not stop a single bad frame from being visible: it
+        moves 1-alpha of the way toward whatever the detector just proposed,
+        and when the frame-level split/merge decision flips (a board fit as
+        one rectangle on frame N and two pieces on frame N+1), the "just
+        proposed" shape can differ enormously from reality.  That single-frame
+        pop is exactly the "randomly increase, decrease, jump" behaviour this
+        clamp exists to remove: after the EMA blend, length and thickness are
+        pulled back to within max_step_frac of last frame's value, so the
+        rendered size can only ever drift toward the true boundary a bounded
+        amount per frame, never leap to it.  Position and rotation are left to
+        the EMA alone, since those legitimately need to track camera motion.
+        """
+        prev = self.quad
+        blended = (alpha * quad + (1.0 - alpha) * prev).astype(np.float32)
+
+        pc, pd, plen, pthk = quad_metrics(prev)
+        bc, bd, blen, bthk = quad_metrics(blended)
+
+        lo_len, hi_len = plen * (1 - max_step_frac), plen * (1 + max_step_frac)
+        lo_thk, hi_thk = pthk * (1 - max_step_frac), pthk * (1 + max_step_frac)
+        clen = float(np.clip(blen, lo_len, hi_len)) if plen > 1e-3 else blen
+        cthk = float(np.clip(bthk, lo_thk, hi_thk)) if pthk > 1e-3 else bthk
+
+        # Rebuild the quad from the (already-smoothed) centre/direction but
+        # the clamped size, using the blended quad's own perpendicular so a
+        # slight perspective skew survives rather than being forced square.
+        bq = canonical(blended)
+        raw_n = (bq[3] - bq[0]) + (bq[2] - bq[1])
+        n = raw_n / (np.linalg.norm(raw_n) + 1e-6)
+        d = bd
+        self.quad = np.float32([
+            bc - d * clen / 2 - n * cthk / 2,
+            bc + d * clen / 2 - n * cthk / 2,
+            bc + d * clen / 2 + n * cthk / 2,
+            bc - d * clen / 2 + n * cthk / 2,
+        ])
+        # bc is already the EMA-blended centre, so this delta is the
+        # (already-damped) observed motion this frame -- feeding it straight
+        # into velocity keeps prediction responsive; smoothing it further
+        # would just reintroduce the pan lag this exists to remove.
+        self.velocity = (bc - pc).astype(np.float32)
         if mask is not None:
             self.mask = mask
         self.hits += 1
@@ -289,15 +468,25 @@ class Track:
         self.conf = conf
 
     def miss(self) -> None:
+        """Dead-reckon through a missed frame instead of freezing.
+
+        A track can still be rendered while held (misses <= max_hold), and a
+        board mid-pan does not stop moving just because one frame's OCR
+        guard or detector had a blip -- freezing here is what produced the
+        stale "ghost" position a real re-detection then had to fight past.
+        """
+        self.quad = self.quad + self.velocity
         self.misses += 1
 
 
 class Tracker:
-    def __init__(self, iou_thr: float, min_hits: int, max_hold: int, alpha: float):
+    def __init__(self, iou_thr: float, min_hits: int, max_hold: int, alpha: float,
+                 max_size_step: float = 0.15):
         self.iou_thr = iou_thr
         self.min_hits = min_hits
         self.max_hold = max_hold
         self.alpha = alpha
+        self.max_size_step = max_size_step
         self.tracks: list[Track] = []
 
     def reset(self) -> None:
@@ -314,16 +503,18 @@ class Tracker:
         used = set()
         for tr in self.tracks:
             best, bi = self.iou_thr, -1
+            pred = tr.predicted_quad()
             for i, d in enumerate(dets):
                 if i in used:
                     continue
-                v = quad_iou(tr.quad, d[0], shape)
+                v = quad_iou(pred, d[0], shape)
                 if v > best:
                     best, bi = v, i
             if bi >= 0:
                 used.add(bi)
                 d = dets[bi]
-                tr.update(d[0], d[1], self.alpha, d[2] if len(d) > 2 else None)
+                tr.update(d[0], d[1], self.alpha, d[2] if len(d) > 2 else None,
+                         self.max_size_step)
             else:
                 tr.miss()
         for i, d in enumerate(dets):
@@ -341,66 +532,29 @@ class Tracker:
 
 # ----------------------------------------------------------------- rail fill
 
-def rail_fill(frame: np.ndarray, quad: np.ndarray, side_frac: float = 0.55,
-              darken: float = 0.90) -> np.ndarray:
-    """Synthesise blank board surface for one quad.
+# Single, fixed paint colour for every board, every frame, every clip.
+#
+# Earlier versions sampled a colour from the rail's own neighbourhood each
+# frame so the fill would read as "a blank LED board" rather than a flat
+# rectangle.  That is explicitly not what is wanted: sampling varies with
+# lighting, camera exposure and what happens to be next to the board, which
+# is a source of the very flicker/colour-drift this project is trying to
+# eliminate.  A single constant avoids that class of bug entirely -- there is
+# no neighbourhood, no percentile, nothing that can differ frame to frame.
+# Neutral dark charcoal: reads as a deliberate "painted over" mask rather
+# than a censor-black box or a distracting colour.
+PAINT_COLOR_BGR = (40, 40, 40)
 
-    Samples the rail immediately left and right of the betting run at the same
-    height, takes a robust dark percentile (LED boards read near-black when not
-    lit), and lays it down with the rail's own vertical shading so the patch
-    does not look like a sticker.
-    """
-    h, w = frame.shape[:2]
+
+def rail_fill(frame: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    """Solid-colour patch sized to the quad.  Same colour every call, everywhere."""
     q = canonical(quad)
     width = float(np.linalg.norm(q[1] - q[0]))
     height = float(np.linalg.norm(q[3] - q[0]))
     if width < 8 or height < 4:
         return np.zeros((0, 0, 3), np.uint8)
-
-    span = max(12.0, width * side_frac)
-    dirv = (q[1] - q[0]) / (np.linalg.norm(q[1] - q[0]) + 1e-6)
-    candidates = []
-    for sgn in (-1.0, 1.0):
-        base_a = q[0] if sgn < 0 else q[1]
-        base_b = q[3] if sgn < 0 else q[2]
-        a = base_a + dirv * span * sgn
-        b = base_b + dirv * span * sgn
-        poly = np.array([base_a, a, b, base_b], np.float32) if sgn < 0 else \
-               np.array([a, base_a, base_b, b], np.float32)
-        m = np.zeros((h, w), np.uint8)
-        cv2.fillConvexPoly(m, poly.astype(np.int32), 255)
-        px = frame[m > 0]
-        if px.size < 30:
-            continue
-        px = px.reshape(-1, 3).astype(np.float32)
-        med = np.median(px, axis=0)
-        # Boards are flat; grass and crowd are not.  Spread tells them apart.
-        spread = float(np.mean(np.abs(px - med)))
-        candidates.append((spread, med, px))
-
-    # A rail that ends mid-frame has board on one side and pitch on the other.
-    # Averaging both gives the muddy colour that belongs to neither, so take
-    # the flatter neighbour and ignore the other entirely.
-    base = None
-    if candidates:
-        spread, med, px = min(candidates, key=lambda c: c[0])
-        if spread < 26.0:
-            base = np.percentile(px, 35, axis=0)
-    if base is None:
-        # No usable neighbour: fall back to the board's own unlit tone, which
-        # is what an LED rail looks like between messages.
-        m = np.zeros((h, w), np.uint8)
-        cv2.fillConvexPoly(m, q.astype(np.int32), 255)
-        px = frame[m > 0]
-        base = (np.percentile(px.reshape(-1, 3), 15, axis=0)
-                if px.size else np.array([32.0, 32.0, 32.0]))
-
-    base = np.clip(base * darken, 0, 255)
     ph, pw = max(2, int(round(height))), max(2, int(round(width)))
-    patch = np.tile(base.astype(np.float32), (ph, pw, 1))
-    # Gentle top-to-bottom falloff mimics how these rails catch stadium light.
-    ramp = np.linspace(1.06, 0.94, ph, dtype=np.float32).reshape(ph, 1, 1)
-    return np.clip(patch * ramp, 0, 255).astype(np.uint8)
+    return np.full((ph, pw, 3), PAINT_COLOR_BGR, np.uint8)
 
 
 def warp_fill(frame: np.ndarray, quad: np.ndarray, patch: np.ndarray) -> np.ndarray:
@@ -675,6 +829,127 @@ class PersonMasker:
 
 # ----------------------------------------------------------------------- main
 
+# ---------------------------------------------------------------------------
+# OCR brand guard (FIX — Issue 3: false detections)
+# ---------------------------------------------------------------------------
+
+_OCR_ENGINE = None
+
+
+def _get_ocr():
+    """Lazy-load OCR engine once; RapidOCR init takes ~300 ms."""
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            _OCR_ENGINE = RapidOCR()
+        except Exception:
+            _OCR_ENGINE = False  # disable on import failure
+    return _OCR_ENGINE if _OCR_ENGINE is not False else None
+
+
+def _ocr_texts(crop: np.ndarray) -> list[str]:
+    """Run OCR on a crop; return list of text strings or empty list."""
+    engine = _get_ocr()
+    if engine is None or crop is None or crop.size == 0:
+        return []
+    try:
+        res, _ = engine(crop)
+    except Exception:
+        return []
+    if not res:
+        return []
+    return [r[1] for r in res if len(r) > 1 and isinstance(r[1], str)]
+
+
+def _crop_for_guard(frame: np.ndarray, quad: np.ndarray,
+                    min_h: int = 80) -> np.ndarray | None:
+    """Axis-aligned crop around the quad, upscaled for legibility."""
+    x0 = int(max(0, np.floor(quad[:, 0].min()) - 4))
+    x1 = int(min(frame.shape[1], np.ceil(quad[:, 0].max()) + 4))
+    y0 = int(max(0, np.floor(quad[:, 1].min()) - 4))
+    y1 = int(min(frame.shape[0], np.ceil(quad[:, 1].max()) + 4))
+    if x1 - x0 < 12 or y1 - y0 < 4:
+        return None
+    crop = frame[y0:y1, x0:x1]
+    h = crop.shape[0]
+    if h < min_h:
+        scale = min_h / h
+        crop = cv2.resize(crop, (max(1, int(crop.shape[1] * scale)),
+                                  max(1, int(h * scale))),
+                          interpolation=cv2.INTER_CUBIC)
+    return crop
+
+
+_GUARD_CACHE: dict[tuple[int, int], tuple[int, bool]] = {}
+_GUARD_FRAME = [0]
+_GUARD_TTL = 20        # frames a cached verdict is trusted before re-checking
+_GUARD_CELL = 40        # px grid cell for matching "the same board" position
+
+
+def _guard_cache_key(quad: np.ndarray) -> tuple[int, int]:
+    c = quad.reshape(4, 2).mean(axis=0)
+    return (int(c[0]) // _GUARD_CELL, int(c[1]) // _GUARD_CELL)
+
+
+def is_betting_board(frame: np.ndarray, quad: np.ndarray,
+                     use_ocr: bool = True) -> bool:
+    """Return False *only* when OCR positively identifies a non-betting brand.
+
+    This guard is fail-open: if OCR returns nothing, or finds text that is
+    neither a known betting brand nor a known non-betting brand, the model's
+    own confidence is trusted and the detection is kept.  Only a positive
+    non-betting match (e.g. 'KRAKEN', 'MARRIOTT') causes rejection.
+
+    Kalshi green boards often produce no OCR output at small scales, so the
+    fail-open behaviour ensures they are still painted by model confidence.
+
+    Cached by rough on-screen position with a short TTL.  A physical board
+    does not change brand between one frame and the next, so re-running OCR
+    on it every single frame is pure cost with no accuracy benefit -- it was
+    also a latent source of instability, since a board that happened to OCR
+    cleanly on frame N and ambiguously on frame N+1 could flicker in and out
+    purely from OCR noise rather than anything about the board changing.
+    """
+    if not use_ocr:
+        return True
+    _GUARD_FRAME[0] += 1
+    now = _GUARD_FRAME[0]
+    key = _guard_cache_key(quad)
+    cached = _GUARD_CACHE.get(key)
+    if cached is not None and now - cached[0] < _GUARD_TTL:
+        return cached[1]
+
+    crop = _crop_for_guard(frame, quad)
+    if crop is None:
+        verdict = True   # too small — trust the model
+    else:
+        texts = _ocr_texts(crop)
+        if not texts:
+            verdict = True   # OCR returned nothing — trust the model
+        else:
+            from v2_brands import is_non_betting, is_betting
+            if any(is_betting(t) for t in texts):
+                # A positive brand match on THIS quad's own crop is strong,
+                # specific evidence for THIS board -- it must not be vetoed
+                # by incidental bleed-over text from a touching neighbour
+                # (the crop margin is only ~4px, see _crop_for_guard, so a
+                # board sitting flush against the next one routinely picks
+                # up a few of its letters). Measured case: a real board read
+                # ['FIFA', 'Betano', 'Betano', 'Betano', 'Betano'] and was
+                # being rejected on the single incidental 'FIFA' match despite
+                # four unambiguous 'Betano' reads in the same crop.
+                verdict = True
+            elif any(is_non_betting(t) for t in texts):
+                verdict = False
+            else:
+                verdict = True   # unknown text — trust the model
+    _GUARD_CACHE[key] = (now, verdict)
+    if len(_GUARD_CACHE) > 400:
+        _GUARD_CACHE.clear()   # cheap bound; a fresh cache costs one extra OCR pass
+    return verdict
+
+
 def process(video: Path, out_path: Path, cfg: dict, debug: bool = False) -> dict:
     from ultralytics import YOLO
 
@@ -682,7 +957,8 @@ def process(video: Path, out_path: Path, cfg: dict, debug: bool = False) -> dict
     person = YOLO(cfg["person_weights"])
     pm = PersonMasker(person, cfg["person_conf"], cfg["person_union"],
                       cfg["person_dilate"], cfg["person_imgsz"])
-    tracker = Tracker(cfg["track_iou"], cfg["min_hits"], cfg["max_hold"], cfg["ema_alpha"])
+    tracker = Tracker(cfg["track_iou"], cfg["min_hits"], cfg["max_hold"], cfg["ema_alpha"],
+                      cfg["max_size_step"])
     overlay = static_overlay_mask(video) if cfg["protect_overlay"] else None
     if overlay is not None:
         print(f"[render] static broadcast overlay: {100 * overlay.mean() / 255:.2f}% of frame")
@@ -729,7 +1005,7 @@ def process(video: Path, out_path: Path, cfg: dict, debug: bool = False) -> dict
             # which is precisely what happened once the threshold was lowered.
             raw, confs = [], []
             for mk, cf in zip(res.masks.data.cpu().numpy(),
-                              res.boxes.conf.cpu().numpy()):
+                               res.boxes.conf.cpu().numpy()):
                 mm = (mk > 0.5).astype(np.uint8)
                 if mm.shape != (h, w):
                     mm = cv2.resize(mm, (w, h), interpolation=cv2.INTER_NEAREST)
@@ -745,11 +1021,19 @@ def process(video: Path, out_path: Path, cfg: dict, debug: bool = False) -> dict
                 confs.append(float(cf))
             kept = merge_overlapping(raw, confs)
             conf_of = max((g["conf"] for g in kept), default=0.0)
-            for q in strips_from_frame([g["mask"] for g in kept], (h, w)):
+            for q in strips_from_frame([g["mask"] for g in kept], (h, w),
+                                       min_aspect=cfg["min_aspect"]):
                 length, thick = quad_shape(q)
-                if thick < 3 or length / thick < 1.6:
+                if thick < 3 or length / thick < cfg["min_aspect"]:
                     continue
                 if thick > cfg["max_thick_frac"] * h:
+                    continue
+                # OCR brand guard (FIX — Issue 3: false detections).
+                # Fail-open: only reject when OCR positively names a
+                # non-betting brand (e.g. Kraken, Marriott).  Unknown
+                # text or no OCR output keeps the detection alive so
+                # Kalshi green boards are never silently dropped here.
+                if not is_betting_board(frame, q, use_ocr=bool(cfg.get("ocr_guard", 1))):
                     continue
                 dets.append((q, conf_of, None))
         if dets:
@@ -763,23 +1047,13 @@ def process(video: Path, out_path: Path, cfg: dict, debug: bool = False) -> dict
             area = np.zeros((h, w), np.uint8)
             grow = np.ones((cfg["mask_grow"], cfg["mask_grow"]), np.uint8) \
                 if cfg["mask_grow"] > 1 else None
+
             for tr in live:
                 quad = tr.quad
                 patch = rail_fill(frame, quad)
                 if patch.size == 0:
                     continue
                 fill = np.maximum(fill, warp_fill(frame, quad, patch))
-                # The panel is exactly the quad: four straight edges, matching
-                # the board it was fitted to.
-                #
-                # Two earlier attempts to be cleverer both made it worse.
-                # Intersecting with the raw segmentation left ragged notches
-                # wherever the mask was imperfect, and unioning in "pixels whose
-                # colour matches the board" painted every crowd pixel that
-                # happened to share that colour -- which is how audience, seats
-                # and people behind the boards ended up inside the panel.
-                # Anything that must not be painted is subtracted afterwards as
-                # its own explicit stage, which keeps those edges sharp too.
                 cv2.fillConvexPoly(area, canonical(quad).astype(np.int32), 255)
 
             if area.any() and cfg["avoid_pitch"]:
@@ -791,10 +1065,6 @@ def process(video: Path, out_path: Path, cfg: dict, debug: bool = False) -> dict
             if area.any():
                 soft = cv2.GaussianBlur(area, (feather | 1, feather | 1), 0) \
                     if feather > 1 else area
-                # Feather first, then cut people out with a hard edge.  Blurring
-                # after the subtraction smears alpha back across the silhouette
-                # and paints a halo onto the player; a crisp edge is also what
-                # a viewer expects where a person occludes a board.
                 people = pm(frame, [t.quad for t in live])
                 soft = cv2.bitwise_and(soft, cv2.bitwise_not(people))
                 a = (soft.astype(np.float32) / 255.0)[:, :, None]
@@ -825,13 +1095,28 @@ DEFAULTS = dict(
     ad_weights=str(ROOT / "models" / "ad_seg_best.pt"),
     person_weights="yolo11m-seg.pt",
     ad_imgsz=1920, person_imgsz=1280,
-    render_conf=0.10, person_conf=0.15,
+    render_conf=0.07, person_conf=0.15,
     person_dilate=9,
-    track_iou=0.30, min_hits=2, max_hold=3, ema_alpha=0.45,
+    track_iou=0.30, min_hits=1,
+    # Dead-reckoned holds (Track.miss) now keep a lost track moving with its
+    # last velocity rather than freezing, so a shorter hold is enough to
+    # bridge a real 1-3 frame miss (a player crossing, one bad OCR read)
+    # while dropping a track faster once it's genuinely lost -- otherwise a
+    # stale coasting track can keep coexisting with the fresh one that
+    # replaces it, and painting the union of both smears the region.
+    max_hold=5,
+    ema_alpha=0.20,
+    max_size_step=0.15,
     feather=5,
-    min_aspect=2.5, max_thick_frac=0.18, mask_grow=3, avoid_pitch=1,
+    # A perimeter board is never square; 1.0 let genuinely blob-shaped false
+    # detections through on shape alone, leaning entirely on the OCR guard
+    # below to catch them.  1.8 still passes every real board measured on this
+    # footage (thinnest ones run well past 3:1) while rejecting blobs before
+    # they ever reach OCR or the tracker.
+    min_aspect=1.8, max_thick_frac=0.12, mask_grow=3, avoid_pitch=1,
     protect_goal=1, protect_overlay=1, extend_rail=0,
-    cut_delta=14.0, person_union=5,
+    cut_delta=22.0, person_union=5,
+    ocr_guard=1,
 )
 
 

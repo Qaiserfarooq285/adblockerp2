@@ -64,8 +64,19 @@ def run(cmd: list[str], log: str) -> None:
         raise RuntimeError(f"step failed ({r.returncode}); see {dst}")
 
 
+# Exactly the 20 clips this project is scoped to.  frames/ocr/annotate were
+# all built against these 20 back when they were the only files present;
+# `newclip.mp4` (380MB, added later, does not match this set's naming
+# convention) sorts after them alphabetically and would silently become an
+# unrequested 21st clip in render_rest if videos() picked up every *.mp4 in
+# the directory.  Named exclusion rather than a bare slice[:20], so a
+# genuinely new *addition* to the real 20 later is not silently dropped too.
+_OUT_OF_SCOPE = {"newclip.mp4"}
+
+
 def videos() -> list[Path]:
-    return sorted(p for p in (ROOT / "data" / "raw_videos").glob("*.mp4"))
+    return sorted(p for p in (ROOT / "data" / "raw_videos").glob("*.mp4")
+                 if p.name not in _OUT_OF_SCOPE)
 
 
 # --------------------------------------------------------------------- steps
@@ -102,10 +113,27 @@ def s_ocr_tiles():
     run([PY, ROOT / "scripts" / "v2_ocr_tiles.py"], "v2_ocr_tiles")
 
 
+@step("ocr_band")
+def s_ocr_band():
+    """Third OCR pass targeted at the perimeter-board band specifically.
+
+    Catches wordmarks (Kalshi, ADI PREDICTSTREET) that are too small in wide,
+    elevated, far-distance shots for the whole-frame and generic-tile passes
+    to read -- see scripts/v2_ocr_band.py for the measured root cause.
+    """
+    run([PY, ROOT / "scripts" / "v2_ocr_band.py"], "v2_ocr_band")
+
+
 @step("annotate")
 def s_annotate():
     """OCR -> betting-strip polygons + vetted background frames."""
     run([PY, ROOT / "scripts" / "v2_annotate.py"], "v2_annotate")
+
+
+@step("external")
+def s_external():
+    """OCR-verified real images from the two external Roboflow datasets."""
+    run([PY, ROOT / "scripts" / "v2_consolidate_external.py"], "v2_consolidate")
 
 
 @step("synth")
@@ -126,6 +154,16 @@ def s_train():
     run([PY, ROOT / "scripts" / "v2_train.py"], "v2_train")
 
 
+@step("targeted_eval")
+def s_targeted_eval():
+    """Recall broken down by brand / board size / side-by-side, not just mAP.
+
+    mAP alone hid two earlier regressions in this project; this is the check
+    that would have caught them before 20 clips got rendered on a worse model.
+    """
+    run([PY, ROOT / "scripts" / "v2_eval_targeted.py"], "v2_eval_targeted")
+
+
 class Gated(Exception):
     """Raised to park the pipeline until a human approves the sample clip."""
 
@@ -134,6 +172,7 @@ def render_clips(indices: list[int]) -> None:
     weights = ROOT / "models" / "ad_seg_best.pt"
     if not weights.exists():
         raise RuntimeError(f"missing {weights}; train must succeed first")
+    weights_mtime = weights.stat().st_mtime
     outdir = ROOT / "outputs" / "clips"
     outdir.mkdir(parents=True, exist_ok=True)
     vids = videos()
@@ -141,8 +180,16 @@ def render_clips(indices: list[int]) -> None:
         v = vids[i - 1]
         dst = outdir / f"clip{i:02d}_clean.mp4"
         if dst.exists() and dst.stat().st_size > 100_000:
-            print(f"    clip{i:02d} already rendered", flush=True)
-            continue
+            # "Resumable" must not mean "reuse a clip rendered by a since-
+            # retrained model" -- that silently shipped 3 stale clips once
+            # already when a retrain finished after render_first had already
+            # run once. A clip older than the weights that would render it
+            # now is stale, not finished.
+            if dst.stat().st_mtime >= weights_mtime:
+                print(f"    clip{i:02d} already rendered (current model)", flush=True)
+                continue
+            print(f"    clip{i:02d} predates current model weights; re-rendering",
+                  flush=True)
         run([PY, ROOT / "scripts" / "v2_render.py", "--input", v,
              "--output", dst, "--ad-weights", weights], "v2_render")
 

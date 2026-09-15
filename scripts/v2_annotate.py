@@ -30,9 +30,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 from v2_brands import classify  # noqa: E402
 
-MIN_QUAD_H = 6.0        # px; OCR noise below this is unusable
-MIN_QUAD_W = 14.0
+MIN_QUAD_H = 4.5        # px; OCR noise below this is unusable
+MIN_QUAD_W = 10.0
 MAX_GROW = 2.6          # cap band growth at this multiple of text height
+MIN_LABEL_ASPECT = 3.0  # real boards in this footage run well past 3:1;
+                        # grow_band's own budget can still leave a squat
+                        # result on a generic dark palette, so enforce this
+                        # directly rather than trusting the multiple alone
 
 
 # ---------------------------------------------------------------- geometry --
@@ -57,20 +61,20 @@ def same_rail(a: np.ndarray, b: np.ndarray) -> bool:
     if min(ta, tb) < MIN_QUAD_H:
         return False
     # Similar apparent height (perspective changes it only gradually).
-    if max(ta, tb) / max(1e-6, min(ta, tb)) > 2.0:
+    if max(ta, tb) / max(1e-6, min(ta, tb)) > 2.5:
         return False
     # Similar slant.
-    if abs(float(np.dot(da, db))) < 0.94:
+    if abs(float(np.dot(da, db))) < 0.88:
         return False
     # Offset perpendicular to the rail must be small ...
     delta = cb - ca
     perp = abs(float(delta[0] * -da[1] + delta[1] * da[0]))
-    if perp > 1.1 * max(ta, tb):
+    if perp > 1.4 * max(ta, tb):
         return False
     # ... and the along-rail gap must be a small multiple of the height.
     along = abs(float(np.dot(delta, da)))
     gap = along - (la + lb) / 2.0
-    return gap < 2.2 * max(ta, tb)
+    return gap < 3.0 * max(ta, tb)
 
 
 def group_quads(quads: list[np.ndarray]) -> list[list[int]]:
@@ -184,7 +188,35 @@ def grow_band(img: np.ndarray, quad: np.ndarray) -> np.ndarray:
     while bot + 1 < ph and match[bot + 1] >= thresh:
         bot += 1
 
-    if top == pad and bot == ph - pad - 1:
+    # MAX_GROW names "the multiple of text height this may grow to", but
+    # nothing enforced that -- the walk could consume the whole search pad
+    # on each side, i.e. grow to 1+2*MAX_GROW times the original thickness,
+    # not MAX_GROW times. On a black-LED board (Kalshi, ADI PREDICTSTREET)
+    # the palette is just black+white/green, generic enough to keep
+    # matching straight into the crowd behind it in a wide shot -- measured
+    # on real footage, a clean 1418x151px rail grew to 1418x550px, and the
+    # model trained on that "learned" boards are nearly-square blobs, which
+    # is exactly the shape the render-time aspect filter then (correctly)
+    # rejects. Clamp growth to what the constant already claims to be.
+    max_extra = thickness * (MAX_GROW - 1.0) / 2.0
+    top = max(top, pad - max_extra)
+    bot = min(bot, ph - pad - 1 + max_extra)
+
+    # Belt and braces: even within that multiple-of-original-height budget,
+    # a long rail (pw large) can still grow thick enough to read as a squat
+    # blob rather than a strip -- real boards in this footage are
+    # consistently well past 3:1 end to end, so treat anything thicker than
+    # that as still-wrong growth and pull it back in, centred on the walk's
+    # own result rather than the original OCR band (a curved rail's true
+    # centreline isn't necessarily the raw text's).
+    grown_h = bot - top + 1
+    min_h = max(pw / MIN_LABEL_ASPECT, thickness)
+    if grown_h > min_h:
+        centre = (top + bot) / 2.0
+        top = centre - min_h / 2.0
+        bot = centre + min_h / 2.0
+
+    if top >= pad and bot <= ph - pad - 1:
         return q
 
     src = np.float32([[0, top], [pw, top], [pw, bot + 1], [0, bot + 1]]).reshape(-1, 1, 2)
@@ -204,10 +236,22 @@ def split_long(quad: np.ndarray, max_len: float = 500.0) -> list[np.ndarray]:
     Segments are safe for the renderer: it fuses collinear neighbours back into
     one panel, so the output is unchanged while the training target becomes
     something the mask head can represent.
+
+    max_len alone can still produce a squat, wrong-shaped segment: a rail
+    thick enough (e.g. one grown to the edge of grow_band's own budget on a
+    hard scene) splits into pieces shorter than they are thick once cut every
+    500px, which is exactly the blob shape this whole module exists to avoid
+    labelling. Segment length is widened to whatever keeps pieces at least
+    MIN_LABEL_ASPECT long relative to their own thickness, up to the 950px
+    ceiling the model was actually measured against -- so a thick rail is cut
+    into fewer, longer, correctly-proportioned pieces instead.
     """
     q = order_quad(quad)
-    _, _, length, _ = quad_metrics(q)
-    n = int(np.ceil(length / max_len))
+    _, _, length, thickness = quad_metrics(q)
+    eff_max_len = max_len
+    if thickness > 1e-3:
+        eff_max_len = min(950.0, max(max_len, thickness * MIN_LABEL_ASPECT))
+    n = int(np.ceil(length / eff_max_len))
     if n <= 1:
         return [q]
     top, bot = q[1] - q[0], q[2] - q[3]
