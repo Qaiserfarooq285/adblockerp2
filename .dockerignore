@@ -1,0 +1,14 @@
+# Keep the image small: multi-GB training data never goes into it.
+.git
+data/
+runs/
+outputs/
+logs/
+input/
+notebooks/
+**/__pycache__
+*.pyc
+.venv/
+**/.env
+# models/ is deliberately NOT excluded: a models/ad_seg_best.pt present at build
+# time is baked into the image (then push it to a PRIVATE registry only).

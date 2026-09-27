@@ -1,0 +1,78 @@
+<!doctype html>
+<!-- Served by scripts/live_stream.py next to the HLS output (copied to index.html). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Betting Ad Blocker – Live</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<style>
+  :root { --bg:#0e1116; --panel:#171b22; --line:#262c36; --text:#e6e9ef; --muted:#8b94a3; --ok:#3fb97a; --warn:#e0a43b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; gap:12px; align-items:center; justify-content:space-between; padding:14px 16px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  h1 { font-size:16px; margin:0; font-weight:600; }
+  label { color:var(--muted); display:flex; gap:6px; align-items:center; cursor:pointer; }
+  main { padding:16px; display:grid; gap:16px; grid-template-columns:1fr; max-width:1600px; margin:0 auto; }
+  main.compare { grid-template-columns:1fr 1fr; }
+  @media (max-width:900px) { main.compare { grid-template-columns:1fr; } }
+  figure { margin:0; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  figcaption { padding:8px 12px; color:var(--muted); font-size:12px; border-bottom:1px solid var(--line); }
+  video { width:100%; display:block; background:#000; aspect-ratio:16/9; }
+  #stats { max-width:1600px; margin:0 auto 24px; padding:0 16px; display:grid; gap:8px; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); }
+  .s { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+  .s b { display:block; font-size:18px; font-variant-numeric:tabular-nums; }
+  .s span { color:var(--muted); font-size:12px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--warn); display:inline-block; }
+  .dot.ok { background:var(--ok); }
+</style>
+</head>
+<body>
+<header>
+  <h1><span id="dot" class="dot"></span>&nbsp; Betting Ad Blocker — live output</h1>
+  <label><input type="checkbox" id="cmp"> compare with the original stream</label>
+</header>
+<main id="grid">
+  <figure><figcaption>Processed (betting ads hidden)</figcaption><video id="out" controls muted autoplay playsinline></video></figure>
+  <figure id="origFig" hidden><figcaption>Original input (runs ahead by the processing delay)</figcaption><video id="orig" controls muted autoplay playsinline></video></figure>
+</main>
+<section id="stats"></section>
+<script>
+  const base = location.pathname.endsWith("/") ? location.pathname : location.pathname.replace(/[^/]*$/, "");
+  function play(el, src) {
+    if (el._hls) { el._hls.destroy(); el._hls = null; }
+    if (window.Hls && Hls.isSupported()) {
+      const h = new Hls({ liveSyncDurationCount: 3, maxLiveSyncPlaybackRate: 1.1 });
+      h.loadSource(src); h.attachMedia(el); el._hls = h;
+      h.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) setTimeout(() => play(el, src), 3000); });
+    } else { el.src = src; }            // Safari plays HLS natively
+  }
+  play(document.getElementById("out"), base + "out/index.m3u8");
+
+  let inputUrl = null;
+  document.getElementById("cmp").addEventListener("change", e => {
+    document.getElementById("origFig").hidden = !e.target.checked;
+    document.getElementById("grid").classList.toggle("compare", e.target.checked);
+    const v = document.getElementById("orig");
+    if (e.target.checked && inputUrl) play(v, inputUrl);
+    if (!e.target.checked && v._hls) { v._hls.destroy(); v._hls = null; }
+  });
+
+  const fields = [["fps_in", "input fps"], ["fps_out", "output fps"], ["processing_latency_s", "processing delay (s)"],
+                  ["det_interval", "detector every N frames"], ["queue", "input queue"], ["dropped", "dropped frames"],
+                  ["reconnects", "input reconnects"], ["tracks", "boards tracked"]];
+  async function refresh() {
+    try {
+      const r = await fetch(base + "status.json", { cache: "no-store" });
+      const s = await r.json();
+      if (/^https?:.*\.m3u8/.test(s.input || "")) inputUrl = s.input;
+      document.getElementById("dot").classList.toggle("ok", s.fps_out > 0);
+      document.getElementById("stats").innerHTML = fields.map(([k, label]) =>
+        `<div class="s"><b>${s[k] ?? "–"}</b><span>${label}</span></div>`).join("") +
+        `<div class="s"><b>${s.time ? s.time.slice(11) : "–"}</b><span>last update</span></div>`;
+    } catch (e) { document.getElementById("dot").classList.remove("ok"); }
+  }
+  refresh(); setInterval(refresh, 5000);
+</script>
+</body>
+</html>

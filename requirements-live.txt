@@ -1,0 +1,10 @@
+# Live renderer only (scripts/live_stream.py, scripts/v2_render.py).  The full
+# requirements.txt adds the training/labelling tooling (YOLOE + CLIP from git),
+# which the GPU pod does not need.
+ultralytics>=8.3
+opencv-python>=4.8
+numpy
+pyyaml
+tqdm
+av>=12.0                    # PyAV: demux/decode the live input, mux raw video + PCM to ffmpeg
+rapidocr_onnxruntime>=1.3   # brand OCR guard; without it boards are painted on model evidence alone

@@ -1,0 +1,5 @@
+# Optional: TensorRT export on the GPU pod (scripts/export_tensorrt.py).
+# 10.1.0 is excluded because Ultralytics rejects it.
+tensorrt>=10.0,!=10.1.0
+onnx>=1.12.0
+onnxslim>=0.1.31

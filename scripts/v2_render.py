@@ -11,10 +11,16 @@ Design notes that matter, because earlier versions failed on each of them:
   smoothing the corners removes that wobble without decoupling the panel from
   the board.
 
-* **Detection-gated, no optical-flow propagation.**  The panel is only drawn
-  where the model currently sees a board (plus a very short hold across
-  dropouts).  Nothing is ever carried by camera motion, which is what made the
-  old panel drift across the pitch during pans.
+* **Camera geometry, corrected by every detection** (`--tracker homography`,
+  the default; see render_engine.py / board_tracker.py / geometry.py).  A
+  full frame-to-frame homography -- fitted with the scoreboard and the LED
+  boards masked out -- carries each board, and each detection corrects it
+  through a Kalman gain, so the panel neither copies detector jitter nor lags
+  a pan, and it coasts through detection dropouts instead of blinking.  The
+  old optical-flow propagation drifted for specific, fixed reasons (4-DOF
+  similarity, scoreboard and LED features in the fit, a fixed 3% correction);
+  geometry.py lists them.  `--tracker legacy` keeps the previous
+  detection-gated tracker for A/B comparison.
 
 * **People are a hard subtraction, computed independently.**  Person masks come
   from a general COCO segmentation model, not from the ad model, and are
@@ -31,6 +37,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from collections import deque
 from pathlib import Path
 
@@ -657,7 +664,23 @@ def extend_rail(frame: np.ndarray, quad: np.ndarray, mask: np.ndarray,
         q[0] + top * lo, q[0] + top * hi, q[3] + bot * hi, q[3] + bot * lo]))
 
 
-def pitch_mask(frame: np.ndarray, dh: int = 6, ds: int = 48, dv: int = 58) -> np.ndarray:
+def pitch_reference(frame: np.ndarray, stride: int = 1) -> np.ndarray | None:
+    """Median HSV of the turf in `frame`, or None when no pitch is in shot.
+
+    `stride` > 1 estimates it from a pixel subsample: the median of a tight
+    colour cluster is unchanged, and on a live frame this is the difference
+    between ~1 ms and ~10 ms.
+    """
+    hsv = cv2.cvtColor(frame[::stride, ::stride] if stride > 1 else frame, cv2.COLOR_BGR2HSV)
+    h_, s_, v_ = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    cand = (h_ >= 38) & (h_ <= 62) & (s_ > 70) & (v_ > 60)
+    if int(cand.sum()) < 0.02 * hsv.shape[0] * hsv.shape[1]:
+        return None                                     # no pitch in shot
+    return np.median(hsv[cand], axis=0)
+
+
+def pitch_mask(frame: np.ndarray, dh: int = 6, ds: int = 48, dv: int = 58,
+               ref: np.ndarray | None = None) -> np.ndarray:
     """Pixels that are almost certainly turf.
 
     On steeply-slanted rails near the corner flag the segmentation over-reaches
@@ -670,13 +693,16 @@ def pitch_mask(frame: np.ndarray, dh: int = 6, ds: int = 48, dv: int = 58) -> np
     the Kalshi wordmark, the one betting brand that is also green, spans H
     35-117 at up to S 246.  Matching turf tightly removes grass without ever
     sparing a Kalshi board.
+
+    `ref` (from pitch_reference) lets a caller measure the turf colour once per
+    shot on the whole frame and then mask only a small crop around the boards.
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     h_, s_, v_ = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-    cand = (h_ >= 38) & (h_ <= 62) & (s_ > 70) & (v_ > 60)
-    if int(cand.sum()) < 0.02 * frame.shape[0] * frame.shape[1]:
-        return np.zeros(frame.shape[:2], np.uint8)      # no pitch in shot
-    ref = np.median(hsv[cand], axis=0)
+    if ref is None:
+        ref = pitch_reference(frame)
+        if ref is None:
+            return np.zeros(frame.shape[:2], np.uint8)  # no pitch in shot
     m = ((np.abs(h_.astype(np.int16) - int(ref[0])) <= dh) &
          (np.abs(s_.astype(np.int16) - int(ref[1])) <= ds) &
          (np.abs(v_.astype(np.int16) - int(ref[2])) <= dv)).astype(np.uint8)
@@ -699,18 +725,14 @@ def crossing_structure(frame: np.ndarray, area: np.ndarray,
     white = ((hsv[:, :, 2] >= v_min) & (hsv[:, :, 1] <= s_max)).astype(np.uint8)
     white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(white, 8)
-    keep = np.zeros_like(white)
-    inside = area > 0
-    for i in range(1, n):
-        if stats[i, cv2.CC_STAT_AREA] < 60:
-            continue
-        comp = labels == i
-        overlap = int(np.count_nonzero(comp & inside))
-        if overlap == 0:
-            continue
-        total = int(stats[i, cv2.CC_STAT_AREA])
-        if (total - overlap) / total >= outside_frac:
-            keep |= comp.astype(np.uint8)
+    # Per-component overlap in one pass (bincount) instead of one full-frame
+    # comparison per component: identical result, and a board full of white
+    # lettering has hundreds of components.
+    total = stats[:, cv2.CC_STAT_AREA].astype(np.int64)
+    overlap = np.bincount(labels[area > 0], minlength=n)[:n]
+    ok = (total >= 60) & (overlap > 0) & ((total - overlap) >= outside_frac * total)
+    ok[0] = False
+    keep = ok[labels].astype(np.uint8)
     if keep.any():
         keep = cv2.dilate(keep, np.ones((3, 3), np.uint8), iterations=1)
     return keep * 255
@@ -950,13 +972,81 @@ def is_betting_board(frame: np.ndarray, quad: np.ndarray,
     return verdict
 
 
-def process(video: Path, out_path: Path, cfg: dict, debug: bool = False) -> dict:
+def _reencode(tmp: Path, video: Path, out_path: Path) -> None:
+    """Re-encode to H.264 so the result plays everywhere, keeping the original audio."""
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(tmp), "-i", str(video),
+           "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "libx264", "-crf", "20",
+           "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+           str(out_path)]
+    if subprocess.run(cmd).returncode == 0:
+        tmp.unlink(missing_ok=True)
+    else:
+        tmp.replace(out_path)
+
+
+def process(video: Path, out_path: Path, cfg: dict, debug: bool = False,
+            panel_log: str | None = None) -> dict:
+    """Render with the homography tracker (render_engine.AdBlockEngine)."""
+    if cfg["tracker"] == "legacy":
+        return process_legacy(video, out_path, cfg, debug, panel_log)
+    from render_engine import AdBlockEngine
+
+    cap = cv2.VideoCapture(str(video))
+    if not cap.isOpened():
+        raise SystemExit(f"cannot open {video}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    overlay = static_overlay_mask(video) if int(cfg["protect_overlay"]) else None
+    if overlay is not None:
+        print(f"[render] static broadcast overlay: {100 * overlay.mean() / 255:.2f}% of frame")
+    engine = AdBlockEngine(cfg, w, h, overlay_mask=overlay, live=False,
+                           debug=debug, panel_log=panel_log, fps=fps)
+
+    tmp = out_path.with_suffix(".tmp.mp4")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(str(tmp), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    t0 = time.time()
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            for out, _ in engine.push(frame):
+                writer.write(out)
+        for out, _ in engine.flush():
+            writer.write(out)
+    finally:
+        cap.release()
+        writer.release()
+        engine.close()
+    _reencode(tmp, video, out_path)
+    st = engine.stats
+    dt = max(1e-6, time.time() - t0)
+    print(f"[render] {st['frames']} frames in {dt:.0f}s ({st['frames'] / dt:.1f} fps); "
+          f"{engine.timing_summary()}")
+    return {"frames": st["frames"], "det_frames": st["det_runs"], "painted": st["painted"],
+            "dets": st["dets"], "cuts": st["cuts"], "ocr_jobs": st["ocr_jobs"],
+            "suppressed_non_betting": st["suppressed"],
+            "panel_frames": {k[6:]: v for k, v in st.items() if k.startswith("panel_")},
+            "track_events": dict(engine.tracker.events)}
+
+
+def process_legacy(video: Path, out_path: Path, cfg: dict, debug: bool = False,
+                   panel_log: str | None = None) -> dict:
+    """The previous detection-gated tracker, kept for A/B comparison.
+
+    With --panel-log it also records each frame's painted quads plus a camera
+    homography measured independently (geometry.py), so
+    scripts/stability_report.py can score both trackers on the same footage.
+    """
     from ultralytics import YOLO
+    from render_engine import parse_imgsz
 
     ad = YOLO(cfg["ad_weights"])
     person = YOLO(cfg["person_weights"])
     pm = PersonMasker(person, cfg["person_conf"], cfg["person_union"],
-                      cfg["person_dilate"], cfg["person_imgsz"])
+                      cfg["person_dilate"], parse_imgsz(cfg["person_imgsz"]))
     tracker = Tracker(cfg["track_iou"], cfg["min_hits"], cfg["max_hold"], cfg["ema_alpha"],
                       cfg["max_size_step"])
     overlay = static_overlay_mask(video) if cfg["protect_overlay"] else None
@@ -977,12 +1067,22 @@ def process(video: Path, out_path: Path, cfg: dict, debug: bool = False) -> dict
     feather = int(cfg["feather"])
     stats = {"frames": 0, "det_frames": 0, "painted": 0, "dets": 0, "cuts": 0}
     prev_small = None
+    ad_imgsz = parse_imgsz(cfg["ad_imgsz"])
+    log = open(panel_log, "w") if panel_log else None
+    meas = None
+    if log is not None:
+        from geometry import CameraMotionEstimator
+        meas = CameraMotionEstimator(w, h)
+        log.write(json.dumps({"header": True, "w": w, "h": h, "fps": fps,
+                              "tracker": "legacy"}) + "\n")
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         stats["frames"] += 1
+        motion = meas.estimate(frame) if meas is not None else None
+        cut_now = False
 
         # Shot-change detection.  Highlight packages cut constantly, and a
         # track held across a cut lands on unrelated content.
@@ -992,9 +1092,10 @@ def process(video: Path, out_path: Path, cfg: dict, debug: bool = False) -> dict
                 tracker.reset()
                 pm.reset()
                 stats["cuts"] += 1
+                cut_now = True
         prev_small = small.astype(np.int16)
 
-        res = ad.predict(frame, conf=cfg["render_conf"], imgsz=cfg["ad_imgsz"],
+        res = ad.predict(frame, conf=cfg["render_conf"], imgsz=ad_imgsz,
                          verbose=False, retina_masks=True)[0]
         dets: list[tuple[np.ndarray, float]] = []
         if res.masks is not None:
@@ -1074,29 +1175,65 @@ def process(video: Path, out_path: Path, cfg: dict, debug: bool = False) -> dict
         if debug:
             for tr in live:
                 cv2.polylines(frame, [tr.quad.astype(np.int32)], True, (0, 255, 255), 2)
+        if log is not None:
+            log.write(json.dumps({
+                "f": stats["frames"] - 1, "cut": cut_now, "det": True,
+                "H": None if motion is None or motion.H is None
+                else np.round(motion.H, 8).ravel().tolist(),
+                "p": [[t.id, "det" if t.misses == 0 else "coast", 1.0,
+                       np.round(t.quad, 2).ravel().tolist()] for t in live]}) + "\n")
         writer.write(frame)
 
     cap.release()
     writer.release()
-
-    # Re-encode to H.264 so the result plays everywhere, keeping the original audio.
-    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(tmp), "-i", str(video),
-           "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "libx264", "-crf", "20",
-           "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
-           str(out_path)]
-    if subprocess.run(cmd).returncode == 0:
-        tmp.unlink(missing_ok=True)
-    else:
-        tmp.replace(out_path)
+    if log is not None:
+        log.close()
+    _reencode(tmp, video, out_path)
     return stats
 
 
 DEFAULTS = dict(
+    # homography = render_engine.AdBlockEngine (camera-geometry tracker);
+    # legacy = process_legacy (the previous detection-gated tracker)
+    tracker="homography",
     ad_weights=str(ROOT / "models" / "ad_seg_best.pt"),
     person_weights="yolo11m-seg.pt",
-    ad_imgsz=1920, person_imgsz=1280,
+    # "1920", or "HxW" for a fixed-shape TensorRT engine (e.g. "1088x1920")
+    ad_imgsz="1920", person_imgsz="1280",
     render_conf=0.07, person_conf=0.15,
     person_dilate=9,
+    device="",               # "" = first CUDA GPU if present; "0", "cpu", ...
+    half=1,                  # FP16 inference on CUDA (ignored for .engine files)
+
+    # ---- homography tracker (render_engine.py / board_tracker.py) ----
+    det_interval=1,          # run the board detector every N frames; the
+                             # homography carries boards in between (live: 2)
+    delay_frames=15,         # paint frame t-D while analysing frame t: panels
+                             # start on a board's first frame, end right after
+                             # its last detection, and OCR has time to answer
+    backfill_frames=15,      # how far before its first detection a board is painted
+    fade_in=3,               # frames to fade in a board picked up mid-shot in plain view
+    motion_width=960,        # working width for the homography fit
+    cut_hist_hard=0.45,      # HSV-histogram correlation below this = hard cut
+    cut_hist_soft=0.75,      # ...below this AND no motion fit = cut (dissolve/wipe)
+    motion_exclude_boxes="0,0,0.30,0.16;0.70,0,1,0.16",   # live only, until the
+                             # online overlay estimate exists: score bug corners
+    trk_min_hits=2, trk_confirm_window=4, trk_birth_conf=0.12,
+    trk_coast_short=8,       # detector runs a board may go unseen in plain view
+    trk_coast_long=40,       # ...during fast pans / at the frame edge
+    trk_fast_pan_px=14.0,
+    trk_r_across=6.0, trk_r_along=60.0,   # detector noise (px^2): edges vs ends
+    trk_q_base=0.05, trk_q_pan=0.03,      # camera-model noise
+    trk_gate=3.0, trk_end_tail=3,
+    roi_person=1,            # person model only in a region around the panels
+    roi_upscale=1.5, person_every=1, person_dynamic=0,
+    person_hist=3,           # frames of camera-warped person masks unioned
+    protect_ema=0.5, protect_on=0.6, protect_off=0.3,   # pitch/goal hysteresis
+    ocr_async=0,             # files: inline (deterministic); live: 1
+    ocr_wait=8,              # frames a new board waits for its OCR verdict
+    ocr_retry=30, ocr_recheck=300, ocr_max_attempts=6,
+
+    # ---- legacy tracker only ----
     track_iou=0.30, min_hits=1,
     # Dead-reckoned holds (Track.miss) now keep a lost track moving with its
     # last velocity rather than freezing, so a shorter hold is enough to
@@ -1125,6 +1262,9 @@ def main() -> int:
     ap.add_argument("--input", required=True)
     ap.add_argument("--output", default=None)
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--panel-log", default=None,
+                    help="write per-frame panel quads + camera motion (JSONL) for "
+                         "scripts/stability_report.py")
     for k, v in DEFAULTS.items():
         ap.add_argument(f"--{k.replace('_', '-')}", type=type(v), default=v)
     args = ap.parse_args()
@@ -1132,7 +1272,7 @@ def main() -> int:
     cfg = {k: getattr(args, k) for k in DEFAULTS}
     src = Path(args.input)
     out = Path(args.output) if args.output else ROOT / "outputs" / f"{src.stem}_clean.mp4"
-    stats = process(src, out, cfg, args.debug)
+    stats = process(src, out, cfg, args.debug, args.panel_log)
     print(json.dumps({"input": src.name, "output": str(out), **stats}, indent=1))
     return 0
 

@@ -482,3 +482,39 @@ export:
   format: tflite
   int8: true
   imgsz: 640
+
+# ---------------------------------------------------------------------------
+# Live streaming (scripts/live_stream.py; deployment: deploy/runpod/)
+# Environment variables on the pod override these: INPUT_URL, OUTPUT_URL,
+# HTTP_PORT, HTTP_TOKEN, ENCODER, VIDEO_BITRATE, AD_WEIGHTS, DET_INTERVAL, ...
+# The renderer itself is scripts/v2_render.py's (DEFAULTS there); `engine:`
+# below overrides individual renderer settings for live use only.
+# ---------------------------------------------------------------------------
+live:
+  input: https://karostream.tulix.tv/FIFA/index.m3u8
+  # hls://<dir>   written on the pod and served on http_port -- on RunPod:
+  #               https://<POD_ID>-8080.proxy.runpod.net/out/index.m3u8
+  # rtmp://host/app/key, srt://host:port?..., udp://... -- pushed to a CDN
+  output: hls:///workspace/live/out
+  http_port: 8080
+  encoder: auto            # NVENC when the GPU has one, else libx264 on the CPU
+  video_bitrate: 6M        # the source is ~3.4 Mbps H.264: re-encoding needs
+                           # headroom above it or generation loss shows
+  audio_bitrate: 160k
+  gop_seconds: 2
+  hls_segment_seconds: 2
+  hls_list_size: 8
+  hls_live_start_index: -3 # start this many segments back from the live edge.
+                           # The Karo playlist's segments are 6-10 s long, so
+                           # -1 saves ~20 s of latency but stalls on any hiccup.
+  stall_timeout_s: 20      # no input data for this long = reconnect
+  max_queue_seconds: 4     # input buffer; beyond it frames are dropped, never
+                           # allowed to pile up into ever-growing latency
+  adaptive: true           # when falling behind, run the detector less often
+  max_det_interval: 4      # ...but at least every 4th frame
+  status_every_s: 10
+  engine:
+    det_interval: 2        # detector on every 2nd frame; the homography carries
+                           # boards in between, so this costs no stability
+    delay_frames: 15       # 0.5 s look-ahead at 30 fps (see render_engine.py)
+    ocr_async: 1           # brand OCR off the frame loop
