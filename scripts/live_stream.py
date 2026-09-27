@@ -8,9 +8,12 @@
              run on separate threads, D frames apart
     egress   PyAV writes raw video + PCM (NUT) --pipe--> ffmpeg encodes
              (h264_nvenc on the GPU, or libx264) and publishes: an HLS
-             directory, RTMP(S), SRT, UDP, or a file
-    http     serves the HLS output, a player page and status.json on
-             --http-port (RunPod exposes it as https://<POD_ID>-<PORT>.proxy.runpod.net)
+             directory, RTMP(S), SRT, UDP, or a file.  The same encode also
+             records the match (tee), and a second stream shows ORIGINAL |
+             BETTING ADS HIDDEN side by side, both halves from one frame
+    http     serves the player page (processed / side-by-side views),
+             status.json and the recordings on --http-port (RunPod exposes it
+             as https://<POD_ID>-<PORT>.proxy.runpod.net)
 
 Audio is decoded and re-muxed with its ORIGINAL timestamps, mapped onto the
 same output timeline as the video, so lip-sync survives processing latency,
@@ -70,13 +73,22 @@ LIVE_DEFAULTS = dict(
     adaptive=True,
     max_det_interval=4,
     status_every_s=10.0,
+    http_root="",                # served on http_port; "" = the HLS output's parent
+                                 # directory, or /workspace/live for other outputs
+    record=True,                 # also save the processed match under record_dir
+    record_dir="",               # "" = <http_root>/recordings
+    compare=True,                # also publish original | processed side by side
+    compare_output="",           # "" = hls://<http_root>/compare
+    compare_bitrate="4M",
     engine={},
 )
 # Engine settings that differ from the offline renderer's defaults.
 LIVE_ENGINE_DEFAULTS = dict(det_interval=2, ocr_async=1, delay_frames=15)
 
 ENV_LIVE = {"INPUT_URL": "input", "OUTPUT_URL": "output", "HTTP_PORT": "http_port",
-            "HTTP_TOKEN": "http_token", "ENCODER": "encoder", "VIDEO_BITRATE": "video_bitrate"}
+            "HTTP_TOKEN": "http_token", "ENCODER": "encoder", "VIDEO_BITRATE": "video_bitrate",
+            "HTTP_ROOT": "http_root", "RECORD": "record", "RECORD_DIR": "record_dir",
+            "COMPARE": "compare", "COMPARE_OUTPUT": "compare_output"}
 ENV_ENGINE = {"AD_WEIGHTS": "ad_weights", "PERSON_WEIGHTS": "person_weights",
               "AD_IMGSZ": "ad_imgsz", "PERSON_IMGSZ": "person_imgsz",
               "PERSON_DYNAMIC": "person_dynamic", "DET_INTERVAL": "det_interval",
@@ -127,6 +139,14 @@ def load_settings(args) -> tuple[dict, dict]:
     for env, key in ENV_ENGINE.items():
         if os.environ.get(env):
             eng[key] = _coerce(os.environ[env], RENDER_DEFAULTS[key])
+
+    kind, hls_dir = output_target(live["output"])
+    if not live["http_root"]:
+        live["http_root"] = str(Path(hls_dir).parent) if kind == "hls" else "/workspace/live"
+    if not live["record_dir"]:
+        live["record_dir"] = str(Path(live["http_root"]) / "recordings")
+    if not live["compare_output"]:
+        live["compare_output"] = "hls://" + str(Path(live["http_root"]) / "compare")
     return live, eng
 
 
@@ -199,44 +219,127 @@ def output_target(output: str) -> tuple[str, str | None]:
     return "file", None
 
 
-def egress_cmd(s: dict, enc: list[str], fps: float, has_audio: bool) -> list[str]:
-    kind, hls_dir = output_target(s["output"])
-    gop = max(1, int(round(fps * float(s["gop_seconds"]))))
-    br = str(s["video_bitrate"])
-    seg = int(s["hls_segment_seconds"])
-    passthrough = ["-fps_mode", "passthrough"] if ffmpeg_major() >= 5 else ["-vsync", "0"]
-    cmd = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "warning", "-f", "nut", "-i", "pipe:0",
-           "-map", "0:v:0"] + (["-map", "0:a:0"] if has_audio else [])
-    cmd += enc + ["-b:v", br, "-maxrate", br, "-bufsize", f"{2 * int(_bits(br))}",
-                  "-g", str(gop), "-keyint_min", str(gop), "-pix_fmt", "yuv420p",
-                  "-profile:v", "high", "-force_key_frames", f"expr:gte(t,n_forced*{seg})"]
-    if "libx264" in enc:
-        cmd += ["-sc_threshold", "0"]
-    else:
-        cmd += ["-forced-idr", "1"]
-    cmd += passthrough
-    if has_audio:
-        cmd += ["-c:a", "aac", "-b:a", str(s["audio_bitrate"]), "-ar", "48000", "-ac", "2",
-                "-af", "aresample=async=1000"]
+def served_file(path: str | None, root: Path | None) -> str | None:
+    """`path` as a URL path under the HTTP root, or None when it is not served."""
+    if not path or root is None:
+        return None
+    try:
+        return Path(path).resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def served_path(target: str, root: Path | None) -> str | None:
+    """The playlist of an HLS output spec, as served; None for RTMP/SRT/files."""
+    kind, d = output_target(target)
+    return served_file(str(Path(d) / "index.m3u8"), root) if kind == "hls" else None
+
+
+def _tee_escape(v: str) -> str:
+    """Escape a value inside a tee muxer slave's [option=value:...] list."""
+    return v.replace("\\", "\\\\").replace(":", "\\:").replace("[", "\\[").replace("]", "\\]")
+
+
+def muxer_for(target: str, s: dict) -> tuple[str, dict, str]:
+    """(ffmpeg format, muxer options, destination) for one output spec."""
+    kind, hls_dir = output_target(target)
     if kind == "hls":
         Path(hls_dir).mkdir(parents=True, exist_ok=True)
-        cmd += ["-f", "hls", "-hls_time", str(seg), "-hls_list_size", str(int(s["hls_list_size"])),
-                "-hls_flags", "delete_segments+independent_segments+omit_endlist"
-                              "+program_date_time+discont_start",
-                "-hls_start_number_source", "epoch",
-                "-hls_segment_filename", str(Path(hls_dir) / "seg_%d.ts"),
-                str(Path(hls_dir) / "index.m3u8")]
-    elif kind == "flv":
-        cmd += ["-f", "flv", "-flvflags", "no_duration_filesize", s["output"]]
-    elif kind in ("mpegts", "rtp_mpegts"):
-        cmd += ["-f", kind, s["output"]]
+        return "hls", {
+            "hls_time": int(s["hls_segment_seconds"]),
+            "hls_list_size": int(s["hls_list_size"]),
+            "hls_flags": "delete_segments+independent_segments+omit_endlist"
+                         "+program_date_time+discont_start",
+            "hls_start_number_source": "epoch",
+            "hls_segment_filename": str(Path(hls_dir) / "seg_%d.ts"),
+        }, str(Path(hls_dir) / "index.m3u8")
+    if kind == "flv":
+        return "flv", {"flvflags": "no_duration_filesize"}, target
+    if kind in ("mpegts", "rtp_mpegts"):
+        return kind, {}, target
+    fmt = {".ts": "mpegts", ".mkv": "matroska", ".flv": "flv"}.get(Path(target).suffix.lower(), "mp4")
+    # fragmented mp4: playable while it is still being written
+    return fmt, ({"movflags": "+frag_keyframe+empty_moov+default_base_moof"} if fmt == "mp4" else {}), target
+
+
+def egress_cmd(s: dict, enc: list[str], fps: float, has_audio: bool,
+               compare: bool, record: str | None) -> list[str]:
+    """One ffmpeg process: the processed stream (+ its recording) and,
+    optionally, the side-by-side stream.
+
+    The recording rides on the processed stream's own encode through the tee
+    muxer -- one encode, two destinations -- and is marked onfail=ignore, so
+    a full disk or a bad path can never take the live output down with it.
+    """
+    gop = max(1, int(round(fps * float(s["gop_seconds"]))))
+    seg = int(s["hls_segment_seconds"])
+    passthrough = ["-fps_mode", "passthrough"] if ffmpeg_major() >= 5 else ["-vsync", "0"]
+
+    def encode(vmap: str, br: str, global_header: bool) -> list[str]:
+        a = ["-map", vmap] + (["-map", "0:a:0"] if has_audio else [])
+        a += enc + ["-b:v", br, "-maxrate", br, "-bufsize", f"{2 * int(_bits(br))}",
+                    "-g", str(gop), "-keyint_min", str(gop), "-pix_fmt", "yuv420p",
+                    "-profile:v", "high", "-force_key_frames", f"expr:gte(t,n_forced*{seg})"]
+        a += ["-sc_threshold", "0"] if "libx264" in enc else ["-forced-idr", "1"]
+        a += passthrough
+        if has_audio:
+            a += ["-c:a", "aac", "-b:a", str(s["audio_bitrate"]), "-ar", "48000", "-ac", "2",
+                  "-af", "aresample=async=1000"]
+        if global_header:
+            # FLV/MP4 need codec headers up front; ffmpeg sets that itself for
+            # a plain output but cannot see through the tee muxer.
+            a += ["-flags:v", "+global_header", "-flags:a", "+global_header"]
+        return a
+
+    def plain(fmt: str, opts: dict, dst: str) -> list[str]:
+        a = []
+        for k, v in opts.items():
+            a += [f"-{k}", str(v)]
+        return a + ["-f", fmt, "-y", dst]
+
+    cmd = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "warning", "-f", "nut", "-i", "pipe:0"]
+    fmt, opts, dst = muxer_for(s["output"], s)
+    if record:
+        main = "[" + ":".join([f"f={fmt}"] + [f"{k}={_tee_escape(str(v))}" for k, v in opts.items()]) + "]"
+        cmd += encode("0:v:0", str(s["video_bitrate"]), fmt in ("flv", "mp4", "matroska"))
+        cmd += ["-f", "tee", f"{main}{dst}|[f=mpegts:onfail=ignore]{record}"]
     else:
-        ext = Path(s["output"]).suffix.lower()
-        fmt = {".ts": "mpegts", ".mkv": "matroska", ".flv": "flv"}.get(ext, "mp4")
-        if fmt == "mp4":   # fragmented: playable while still being written
-            cmd += ["-movflags", "+frag_keyframe+empty_moov+default_base_moof"]
-        cmd += ["-f", fmt, "-y", s["output"]]
+        cmd += encode("0:v:0", str(s["video_bitrate"]), False) + plain(fmt, opts, dst)
+    if compare:
+        cmd += encode("0:v:1", str(s["compare_bitrate"]), False) + plain(*muxer_for(s["compare_output"], s))
     return cmd
+
+
+def half_size(w: int, h: int) -> tuple[int, int]:
+    """Each half of the side-by-side picture: half size, even (yuv420p)."""
+    return max(2, (w // 2) & ~1), max(2, (h // 2) & ~1)
+
+
+def side_by_side(original_half: np.ndarray | None, processed: np.ndarray,
+                 canvas: np.ndarray) -> np.ndarray:
+    """ORIGINAL | BETTING ADS HIDDEN, both halves from the same instant.
+
+    Built from one frame's before and after, never from two streams, so the
+    halves cannot drift apart the way two separate players do.  A missing
+    original leaves its half black rather than silently showing the
+    processed picture twice.
+    """
+    h2, w2 = canvas.shape[0], canvas.shape[1] // 2
+    if original_half is None:
+        canvas[:, :w2] = 0
+    else:
+        if original_half.shape[:2] != (h2, w2):
+            original_half = cv2.resize(original_half, (w2, h2), interpolation=cv2.INTER_AREA)
+        canvas[:, :w2] = original_half
+    canvas[:, w2:] = cv2.resize(processed, (w2, h2), interpolation=cv2.INTER_AREA)
+    canvas[:, w2 - 1:w2 + 1] = 255
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for x0, label in ((0, "ORIGINAL"), (w2, "BETTING ADS HIDDEN")):
+        (tw, th), base = cv2.getTextSize(label, font, 0.8, 2)
+        cx = x0 + w2 // 2
+        cv2.rectangle(canvas, (cx - tw // 2 - 12, 0), (cx + tw // 2 + 12, th + base + 14), (0, 0, 0), -1)
+        cv2.putText(canvas, label, (cx - tw // 2, th + 8), font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    return canvas
 
 
 def _bits(rate: str) -> float:
@@ -377,8 +480,15 @@ class Ingest(threading.Thread):
                         if fr.time is None:
                             continue
                         img = self._bgr(fr)
+                        # The side-by-side stream needs the frame as it was
+                        # BEFORE painting; the renderer paints in place, so the
+                        # half-size copy is taken here, on this thread.
+                        small = (cv2.resize(img, half_size(img.shape[1], img.shape[0]),
+                                            interpolation=cv2.INTER_AREA)
+                                 if self.s["compare"] else None)
                         self.stats["frames_in"] += 1
-                        self._put_frame(("frame", img, self.timeline.video(fr.time), time.monotonic()))
+                        self._put_frame(("frame", img, self.timeline.video(fr.time),
+                                         time.monotonic(), small))
                 else:
                     for fr in decoded:
                         if fr.time is None:
@@ -438,9 +548,23 @@ class Egress(threading.Thread):
         self.s, self.video_q, self.audio_q, self.stats = s, video_q, audio_q, stats
         self.enc = pick_encoder(str(s["encoder"]))
         self.params = None                  # (w, h, fps, has_audio), set by "reconfig"
+        self.compare = bool(s["compare"])
+        self.recording: str | None = None   # file the current session records into
         self.pending_audio: deque = deque()
         self.tail: deque = deque(maxlen=20)
         self.latency = deque(maxlen=300)
+
+    def _recording_path(self) -> str | None:
+        """A new file per output session: a restart never overwrites a match."""
+        if not self.s["record"]:
+            return None
+        try:
+            d = Path(self.s["record_dir"])
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log("egress", f"recording disabled: cannot create {self.s['record_dir']} ({exc})")
+            return None
+        return str(d / time.strftime("match-%Y%m%d-%H%M%SZ.ts", time.gmtime()))
 
     def run(self) -> None:
         """Runs until it receives the None sentinel -- never merely because a
@@ -471,14 +595,23 @@ class Egress(threading.Thread):
         input geometry changed and the output must be restarted with it."""
         import av
         w, h, fps, has_audio = self.params
-        cmd = egress_cmd(self.s, self.enc, fps, has_audio)
+        self.recording = self._recording_path()
+        cmd = egress_cmd(self.s, self.enc, fps, has_audio, self.compare, self.recording)
         log("egress", "starting: " + " ".join(cmd))
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         threading.Thread(target=_drain, args=(proc, "egress-ffmpeg", self.tail), daemon=True).start()
         out = av.open(_Pipe(proc.stdin), mode="w", format="nut")
-        vs = out.add_stream("rawvideo", rate=Fraction(fps).limit_denominator(1001))
+        rate = Fraction(fps).limit_denominator(1001)
+        vs = out.add_stream("rawvideo", rate=rate)
         vs.width, vs.height, vs.pix_fmt = w, h, "yuv420p"
         vs.codec_context.time_base = Fraction(1, 90000)
+        vc = canvas = None
+        if self.compare:                    # second video stream: original | processed
+            w2, h2 = half_size(w, h)
+            vc = out.add_stream("rawvideo", rate=rate)
+            vc.width, vc.height, vc.pix_fmt = 2 * w2, h2, "yuv420p"
+            vc.codec_context.time_base = Fraction(1, 90000)
+            canvas = np.zeros((h2, 2 * w2, 3), np.uint8)
         ast = None
         if has_audio:
             ast = out.add_stream("pcm_s16le", rate=48000)
@@ -502,18 +635,25 @@ class Egress(threading.Thread):
                         done = False
                         break
                     continue
-                frame, (t, t_recv) = item
+                frame, meta = item
+                t, t_recv = meta[0], meta[1]
                 if t <= last_v:
                     t = last_v + 1e-3
                 # Audio up to just past this frame; the muxer interleaves.
                 if ast is not None:
                     last_a_end = self._write_audio(out, ast, t + 0.25, last_a_end)
-                yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV_I420)
-                vf = av.VideoFrame.from_ndarray(yuv, format="yuv420p")
-                vf.pts = int(round(t * 90000))
-                vf.time_base = Fraction(1, 90000)
-                for p in vs.encode(vf):
-                    out.mux(p)
+                pts = int(round(t * 90000))
+                for stream, img in ((vs, frame), (vc, None)):
+                    if stream is None:
+                        continue
+                    if img is None:                  # the side-by-side picture, same pts
+                        img = side_by_side(meta[2] if len(meta) > 2 else None, frame, canvas)
+                    vf = av.VideoFrame.from_ndarray(cv2.cvtColor(img, cv2.COLOR_BGR2YUV_I420),
+                                                    format="yuv420p")
+                    vf.pts = pts
+                    vf.time_base = Fraction(1, 90000)
+                    for p in stream.encode(vf):
+                        out.mux(p)
                 last_v = t
                 self.stats["frames_out"] += 1
                 self.latency.append(time.monotonic() - t_recv)
@@ -521,8 +661,10 @@ class Egress(threading.Thread):
                     raise RuntimeError(f"ffmpeg exited with {proc.returncode}")
         finally:
             try:
-                for p in vs.encode(None):
-                    out.mux(p)
+                for stream in (vs, vc):
+                    if stream is not None:
+                        for p in stream.encode(None):
+                            out.mux(p)
                 out.close()
             except Exception:
                 pass
@@ -605,7 +747,7 @@ def serve_http(root: Path, port: int, token: str) -> None:
     pod = os.environ.get("RUNPOD_POD_ID")
     base = f"https://{pod}-{port}.proxy.runpod.net" if pod else f"http://<host>:{port}"
     pre = f"/{_Handler.token}" if _Handler.token else ""
-    log("http", f"serving {root} -- player: {base}{pre}/  stream: {base}{pre}/out/index.m3u8")
+    log("http", f"serving {root} -- player page: {base}{pre}/")
 
 
 # ---------------------------------------------------------------------- main
@@ -631,16 +773,30 @@ def main() -> int:
         return 0
 
     from render_engine import AdBlockEngine
-    kind, hls_dir = output_target(s["output"])
-    http_root = None
-    if kind == "hls":
-        http_root = Path(hls_dir).parent
+    http_root: Path | None = Path(s["http_root"])
+    try:
         http_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log("http", f"cannot create {http_root} ({exc}): no player page or status file")
+        http_root = None
+    if http_root is not None:
         player = ROOT / "deploy" / "web" / "player.html"
         if player.exists():
             shutil.copy(player, http_root / "index.html")
-    if http_root is not None and int(s["http_port"]) > 0:
-        serve_http(http_root, int(s["http_port"]), str(s.get("http_token") or ""))
+        if int(s["http_port"]) > 0:
+            serve_http(http_root, int(s["http_port"]), str(s.get("http_token") or ""))
+    links = {"stream": served_path(s["output"], http_root),
+             "compare": served_path(s["compare_output"], http_root) if s["compare"] else None}
+
+    def write_status(st: dict) -> None:
+        if http_root is None:
+            return
+        tmp = http_root / "status.json.tmp"
+        tmp.write_text(json.dumps(st, indent=1, default=float))
+        tmp.replace(http_root / "status.json")
+
+    write_status(dict(time=time.strftime("%Y-%m-%dT%H:%M:%S"), input=s["input"],
+                      output=s["output"], fps_in=0, fps_out=0, **links, recording=None))
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: _STOP.set())
@@ -691,8 +847,8 @@ def main() -> int:
                 video_q.put(dict(info))                 # (re)configures the egress
                 continue
             if item is not None and engine is not None:
-                _, img, t_out, t_recv = item
-                engine.push(img, meta=(t_out, t_recv))
+                _, img, t_out, t_recv, small = item
+                engine.push(img, meta=(t_out, t_recv, small))
 
             now = time.monotonic()
             if engine is not None and s["adaptive"] and now - last_adapt > 1.0:
@@ -716,15 +872,13 @@ def main() -> int:
                           fps_out=round((fout - last_out) / dt, 2), queue=frames_q.qsize(),
                           det_interval=cur_det, processing_latency_s=round(lat, 2),
                           engine_ms=(engine.timing if engine else {}), **stats,
-                          tracks=(len(engine.tracker.tracks) if engine else 0))
+                          tracks=(len(engine.tracker.tracks) if engine else 0), **links,
+                          recording=served_file(egress.recording, http_root))
                 log("status", f"in {st['fps_in']} fps, out {st['fps_out']} fps, queue {st['queue']}, "
                               f"det/{cur_det}, latency {lat:.2f}s, dropped {stats['dropped']}, "
                               f"reconnects {stats['reconnects']} | "
                               + (engine.timing_summary() if engine else "no input yet"))
-                if http_root is not None:
-                    tmp = http_root / "status.json.tmp"
-                    tmp.write_text(json.dumps(st, indent=1, default=float))
-                    tmp.replace(http_root / "status.json")
+                write_status(st)
                 last_status, last_in, last_out = now, fin, fout
     finally:
         # Order matters: stop the input, let the engine drain through the

@@ -153,7 +153,9 @@ python scripts/live_stream.py --input match.mp4 --loop --output hls:///tmp/live/
 2. Either build and push the image (`docker build -f deploy/runpod/Dockerfile -t <registry>/betting-ad-blocker-live:1.0 . && docker push …`, then set `IMAGE`), or skip that and use `--bootstrap`, which starts the stock PyTorch image and clones this repo on the pod.
 3. Make the board model reachable: bake `models/ad_seg_best.pt` into a private image, set `AD_WEIGHTS_URL`, or upload it to `/workspace/models/` on the pod's volume.
 4. `python deploy/runpod/runpod_deploy.py create` (or `create --bootstrap`). The first start builds TensorRT engines for that GPU (a few minutes; cached on the volume).
-5. Open `https://<POD_ID>-8080.proxy.runpod.net/<HTTP_TOKEN>/`: the processed stream, a side-by-side comparison with the original, and live pipeline stats. `status <pod_id>` prints the same stats; `stop <pod_id>` stops GPU billing.
+5. Open `https://<POD_ID>-8080.proxy.runpod.net/<HTTP_TOKEN>/`. The page has two views: **Processed** (the stream viewers get) and **Side by side** (ORIGINAL | BETTING ADS HIDDEN, both halves cut from the same frame so they never drift apart), plus live pipeline stats and a download link for the recording of the match so far. `status <pod_id>` prints the same stats; `stop <pod_id>` stops GPU billing.
+
+Every processed match is also saved on the pod's volume (`/workspace/live/recordings/`, about 2.7 GB per hour at 6 Mbps) from the same encode as the live stream, and a failed recording never interrupts the live output. With `OUTPUT_URL` set to an RTMP/SRT address (for example Tulix's ingest), the page still serves the side-by-side view and the recordings. `RECORD=0` / `COMPARE=0` turn either off.
 
 Pick a GPU with a hardware encoder (NVENC): RTX 4090, L40S, RTX A6000, L4. A100 and H100 have none; there the encoder falls back to CPU x264.
 

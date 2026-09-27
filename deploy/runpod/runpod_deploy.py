@@ -35,6 +35,7 @@ HTTP_PORT = 8080
 # Environment variables forwarded to the pod (only those that are set).
 POD_ENV = ("INPUT_URL", "OUTPUT_URL", "HTTP_TOKEN", "AD_WEIGHTS_URL", "USE_TENSORRT",
            "DET_INTERVAL", "ENCODER", "VIDEO_BITRATE", "DEVICE", "LIVE_CONFIG",
+           "RECORD", "RECORD_DIR", "COMPARE", "COMPARE_OUTPUT", "HTTP_ROOT",
            "REPO_URL", "REPO_REF")
 
 

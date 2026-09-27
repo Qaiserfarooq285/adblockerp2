@@ -513,6 +513,19 @@ live:
   adaptive: true           # when falling behind, run the detector less often
   max_det_interval: 4      # ...but at least every 4th frame
   status_every_s: 10
+  http_root: ""            # served on http_port (player page, status.json,
+                           # recordings); "" = the HLS output's parent directory,
+                           # or /workspace/live when the output is RTMP/SRT
+  record: true             # also save the processed match (MPEG-TS). One encode
+                           # feeds both the live output and the file, and a
+                           # recording failure never stops the live stream.
+                           # About 2.7 GB per hour at 6 Mbps: size the volume.
+  record_dir: ""           # "" = <http_root>/recordings, downloadable from the page
+  compare: true            # also publish ORIGINAL | BETTING ADS HIDDEN side by side,
+                           # both halves cut from the same frame, so they never
+                           # drift apart the way two separate players do
+  compare_output: ""       # "" = hls://<http_root>/compare, or an RTMP/SRT URL
+  compare_bitrate: 4M
   engine:
     det_interval: 2        # detector on every 2nd frame; the homography carries
                            # boards in between, so this costs no stability
