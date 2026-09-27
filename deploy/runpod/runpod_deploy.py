@@ -100,7 +100,7 @@ def pod_body(env: dict, bootstrap: bool) -> dict:
         body["containerRegistryAuthId"] = env["REGISTRY_AUTH_ID"]
     if bootstrap:
         body["imageName"] = BOOTSTRAP_IMAGE
-        pod_env.setdefault("REPO_URL", "https://github.com/Qaiserfarooq285/adblocker.git")
+        pod_env.setdefault("REPO_URL", "https://github.com/Qaiserfarooq285/adblockerp2.git")
         pod_env.setdefault("REPO_REF", "main")
         body["dockerEntrypoint"] = ["bash", "-c"]
         body["dockerStartCmd"] = [BOOTSTRAP]
