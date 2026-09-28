@@ -14,6 +14,11 @@
     http     serves the player page (processed / side-by-side views),
              status.json and the recordings on --http-port (RunPod exposes it
              as https://<POD_ID>-<PORT>.proxy.runpod.net)
+    learn    the operator page (operator.html + /api/, own password): mark a
+             logo on a paused frame, decide new sponsors the brand scan found,
+             switch model versions.  Decisions apply live within a second; the
+             original feed and training frames are kept under LEARN_DIR for
+             learn_retrain.py, which trains the next model version
 
 Audio is decoded and re-muxed with its ORIGINAL timestamps, mapped onto the
 same output timeline as the video, so lip-sync survives processing latency,
@@ -27,7 +32,8 @@ that lives in render_engine.py, shared with the offline renderer.
 Environment variables override config.yaml (the RunPod container sets them):
 INPUT_URL, OUTPUT_URL, HTTP_PORT, HTTP_TOKEN, ENCODER, VIDEO_BITRATE,
 AD_WEIGHTS, PERSON_WEIGHTS, AD_IMGSZ, PERSON_IMGSZ, PERSON_DYNAMIC,
-DET_INTERVAL, DEVICE.
+DET_INTERVAL, DEVICE, and for learning LEARN, LEARN_DIR, OPERATOR_TOKEN, SCAN,
+RECORD_ORIGINAL, AUTO_TRAIN.
 """
 from __future__ import annotations
 
@@ -81,14 +87,37 @@ LIVE_DEFAULTS = dict(
     compare_output="",           # "" = hls://<http_root>/compare
     compare_bitrate="4M",
     engine={},
+    learn={},                    # teaching it new brands: LEARN_DEFAULTS
 )
-# Engine settings that differ from the offline renderer's defaults.
-LIVE_ENGINE_DEFAULTS = dict(det_interval=2, ocr_async=1, delay_frames=15)
+LEARN_DEFAULTS = dict(
+    enabled=True,
+    dir="",                      # "" = LEARN_DIR, else /workspace/learning (RunPod volume),
+                                 # else <repo>/learning
+    operator_token="",           # the operator page's password; "" = no operator page
+    scan=True,                   # read every board ~1/s, so brands the model has not
+                                 # learned are hidden as soon as the library names them
+    scan_threads=2,
+    record_original=True,        # keep the original feed (stream copy) to retrain from
+    original_max_gb=15.0,        # the oldest original recordings go beyond this
+    samples=True,                # save training frames automatically
+    snapshot_seconds=90,         # how far back the operator can pick a frame to mark
+    auto_train="idle",           # off | idle: retrain once the input has been down idle_minutes |
+                                 # daily@HH:MM: every day at that time, UTC (shares the GPU
+                                 # with a live stream if one is running)
+    idle_minutes=20,
+    min_new_samples=30,          # ...and at least this many new training frames exist
+)
+# Engine settings that differ from the offline renderer's defaults.  The longer
+# look-ahead lets a brand read by the scan (~0.5-1 s per frame) still be
+# painted from the first frame of the shot, through the back-fill.
+LIVE_ENGINE_DEFAULTS = dict(det_interval=2, ocr_async=1, delay_frames=36, backfill_frames=36)
 
 ENV_LIVE = {"INPUT_URL": "input", "OUTPUT_URL": "output", "HTTP_PORT": "http_port",
             "HTTP_TOKEN": "http_token", "ENCODER": "encoder", "VIDEO_BITRATE": "video_bitrate",
             "HTTP_ROOT": "http_root", "RECORD": "record", "RECORD_DIR": "record_dir",
             "COMPARE": "compare", "COMPARE_OUTPUT": "compare_output"}
+ENV_LEARN = {"LEARN": "enabled", "LEARN_DIR": "dir", "OPERATOR_TOKEN": "operator_token",
+             "SCAN": "scan", "RECORD_ORIGINAL": "record_original", "AUTO_TRAIN": "auto_train"}
 ENV_ENGINE = {"AD_WEIGHTS": "ad_weights", "PERSON_WEIGHTS": "person_weights",
               "AD_IMGSZ": "ad_imgsz", "PERSON_IMGSZ": "person_imgsz",
               "PERSON_DYNAMIC": "person_dynamic", "DET_INTERVAL": "det_interval",
@@ -140,6 +169,16 @@ def load_settings(args) -> tuple[dict, dict]:
         if os.environ.get(env):
             eng[key] = _coerce(os.environ[env], RENDER_DEFAULTS[key])
 
+    learn = dict(LEARN_DEFAULTS)
+    for k, v in (live.get("learn") or {}).items():
+        if k not in LEARN_DEFAULTS:
+            raise SystemExit(f"config live.learn.{k}: unknown setting")
+        learn[k] = _coerce(v, LEARN_DEFAULTS[k]) if v is not None else LEARN_DEFAULTS[k]
+    for env, key in ENV_LEARN.items():
+        if os.environ.get(env):
+            learn[key] = _coerce(os.environ[env], LEARN_DEFAULTS[key])
+    live["learn"] = learn
+
     kind, hls_dir = output_target(live["output"])
     if not live["http_root"]:
         live["http_root"] = str(Path(hls_dir).parent) if kind == "hls" else "/workspace/live"
@@ -190,7 +229,10 @@ def pick_encoder(pref: str) -> list[str]:
     return X264_ARGS
 
 
-def ingest_cmd(url: str, s: dict) -> list[str]:
+def ingest_cmd(url: str, s: dict, record_dir: str | None = None) -> list[str]:
+    """ffmpeg reading the input; with `record_dir` it also saves the ORIGINAL
+    feed there (stream copy, 15-minute files) for the retraining job -- via the
+    tee muxer with onfail=ignore, so a full disk never stops the live input."""
     cmd = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "warning"]
     is_file = Path(url).exists()
     if is_file:
@@ -202,7 +244,13 @@ def ingest_cmd(url: str, s: dict) -> list[str]:
         else:   # raw MPEG-TS over HTTP (e.g. Flussonic /mpegts): let ffmpeg reconnect
             cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
     cmd += ["-fflags", "+genpts+discardcorrupt", "-i", url,
-            "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-f", "mpegts", "pipe:1"]
+            "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy"]
+    if record_dir:
+        pattern = _tee_escape(str(Path(record_dir) / "original-%Y%m%d-%H%M%S.ts"))
+        cmd += ["-f", "tee", "[f=mpegts]pipe:1|[f=segment:segment_time=900:strftime=1:"
+                             f"segment_format=mpegts:onfail=ignore]{pattern}"]
+    else:
+        cmd += ["-f", "mpegts", "pipe:1"]
     return cmd
 
 
@@ -390,11 +438,14 @@ class Timeline:
 # -------------------------------------------------------------------- ingest
 
 class Ingest(threading.Thread):
-    def __init__(self, s: dict, frames_q: queue.Queue, audio_q: queue.Queue, stats: dict):
+    def __init__(self, s: dict, frames_q: queue.Queue, audio_q: queue.Queue, stats: dict,
+                 record_dir: str | None = None):
         super().__init__(name="ingest", daemon=True)
         self.s, self.frames_q, self.audio_q, self.stats = s, frames_q, audio_q, stats
         self.url = s["input"]
         self.is_file = Path(self.url).exists()
+        # a file input is its own original; only a live feed is recorded
+        self.record_dir = None if self.is_file else record_dir
         self.timeline = Timeline()
         self.last_packet = time.monotonic()
         self.tail: deque = deque(maxlen=20)
@@ -426,7 +477,7 @@ class Ingest(threading.Thread):
 
     def _session(self) -> bool:
         import av
-        cmd = ingest_cmd(self.url, self.s)
+        cmd = ingest_cmd(self.url, self.s, self.record_dir)
         log("ingest", "starting: " + " ".join(cmd))
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
         threading.Thread(target=_drain, args=(proc, "ingest-ffmpeg", self.tail), daemon=True).start()
@@ -543,9 +594,11 @@ class _Pipe:
 class Egress(threading.Thread):
     """Frames (in order, from the engine) + audio -> NUT -> ffmpeg -> output."""
 
-    def __init__(self, s: dict, video_q: queue.Queue, audio_q: queue.Queue, stats: dict):
+    def __init__(self, s: dict, video_q: queue.Queue, audio_q: queue.Queue, stats: dict,
+                 clock=None):
         super().__init__(name="egress", daemon=True)
         self.s, self.video_q, self.audio_q, self.stats = s, video_q, audio_q, stats
+        self.clock = clock                  # learn_store.OutputClock: player time -> frame
         self.enc = pick_encoder(str(s["encoder"]))
         self.params = None                  # (w, h, fps, has_audio), set by "reconfig"
         self.compare = bool(s["compare"])
@@ -639,6 +692,8 @@ class Egress(threading.Thread):
                 t, t_recv = meta[0], meta[1]
                 if t <= last_v:
                     t = last_v + 1e-3
+                if last_v < 0 and self.clock is not None:
+                    self.clock.start(t)              # the HLS programme date starts here
                 # Audio up to just past this frame; the muxer interleaves.
                 if ast is not None:
                     last_a_end = self._write_audio(out, ast, t + 0.25, last_a_end)
@@ -713,15 +768,63 @@ class Egress(threading.Thread):
 
 class _Handler(SimpleHTTPRequestHandler):
     token = ""
+    api = None                              # operator_api.OperatorAPI, when enabled
 
     def log_message(self, *a) -> None:      # quiet: HLS players poll constantly
         pass
 
     def end_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if not getattr(self, "_is_api", False):
+            self.send_header("Access-Control-Allow-Origin", "*")
         if self.path.split("?")[0].endswith((".m3u8", ".json")):
             self.send_header("Cache-Control", "no-cache, no-store")
         super().end_headers()
+
+    def _api_route(self) -> tuple[str | None, str]:
+        """('state', query) for <token>/api/state?..., else (None, '')."""
+        path, _, query = self.path.partition("?")
+        if self.token:
+            prefix = f"/{self.token}"
+            if not path.startswith(prefix + "/"):
+                return None, ""
+            path = path[len(prefix):]
+        return (path[5:], query) if path.startswith("/api/") else (None, "")
+
+    def do_GET(self) -> None:
+        sub, query = self._api_route()
+        if sub is None:
+            return super().do_GET()
+        self._api("GET", sub, query)
+
+    def do_POST(self) -> None:
+        sub, query = self._api_route()
+        if sub is None:
+            self.send_error(404)
+            return
+        self._api("POST", sub, query)
+
+    def _api(self, method: str, sub: str, query: str) -> None:
+        self._is_api = True
+        if self.api is None:
+            code, ctype, body = 404, "application/json", \
+                b'{"error": "the operator page is off: set OPERATOR_TOKEN on the pod"}'
+        else:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 256 * 1024:
+                code, ctype, body = 413, "application/json", b'{"error": "request too large"}'
+            else:
+                data = self.rfile.read(n) if n > 0 else b""
+                try:
+                    code, ctype, body = self.api.handle(method, sub, query, data, self.headers)
+                except Exception as exc:              # never let a bad request kill the server
+                    log("api", f"{method} {sub}: {type(exc).__name__}: {exc}")
+                    code, ctype, body = 500, "application/json", b'{"error": "internal error"}'
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def guess_type(self, path):
         if str(path).endswith(".m3u8"):
@@ -739,15 +842,151 @@ class _Handler(SimpleHTTPRequestHandler):
         return super().translate_path(path)
 
 
-def serve_http(root: Path, port: int, token: str) -> None:
+class _Server(ThreadingHTTPServer):
+    # The default listen backlog is 5: a few HLS players, or the operator
+    # page fetching a strip of frames, overflow it and connections are reset.
+    request_queue_size = 128
+    daemon_threads = True
+
+
+def serve_http(root: Path, port: int, token: str, api=None) -> None:
     handler = functools.partial(_Handler, directory=str(root))
     _Handler.token = token.strip("/")
-    httpd = ThreadingHTTPServer(("0.0.0.0", port), handler)
+    _Handler.api = api
+    httpd = _Server(("0.0.0.0", port), handler)
     threading.Thread(target=httpd.serve_forever, name="http", daemon=True).start()
     pod = os.environ.get("RUNPOD_POD_ID")
     base = f"https://{pod}-{port}.proxy.runpod.net" if pod else f"http://<host>:{port}"
     pre = f"/{_Handler.token}" if _Handler.token else ""
-    log("http", f"serving {root} -- player page: {base}{pre}/")
+    log("http", f"serving {root} -- player page: {base}{pre}/"
+                + (f" -- operator page: {base}{pre}/operator.html" if api is not None else ""))
+
+
+# --------------------------------------------------------------------- learn
+
+def runtime_weights(pt: str) -> str:
+    """The TensorRT engine start.sh built for these weights on this GPU, if any."""
+    d = os.environ.get("TRT_ENGINE_DIR")
+    if d:
+        eng = Path(d) / (Path(pt).stem + ".engine")
+        if eng.is_file():
+            return str(eng)
+    return pt
+
+
+class Learning:
+    """The Brand Library, the brand scan, training data, model versions and the
+    operator page's API -- everything that lets the pipeline learn new brands."""
+
+    def __init__(self, s: dict, ecfg: dict):
+        from brand_library import BrandLibrary
+        from brand_scan import BrandScanner
+        from learn_jobs import ModelRegistry, RetrainJob
+        from learn_store import (LearnDir, OutputClock, ReviewQueue, SampleStore, Snapshots,
+                                 default_learn_dir)
+        from render_engine import parse_boxes
+        L = self.cfg = s["learn"]
+        self.ld = LearnDir(L["dir"] or default_learn_dir())
+        self.library = BrandLibrary(self.ld.brands_file)
+        self.reviews = ReviewQueue(self.ld)
+        self.samples = SampleStore(self.ld)
+        self.snapshots = Snapshots(seconds=float(L["snapshot_seconds"]))
+        self.clock = OutputClock()
+        self.record_dir = str(self.ld.root / "recordings") if L["record_original"] else None
+        # the ORIGINAL model (start.sh passes it when AD_WEIGHTS is a version or an engine)
+        self.models = ModelRegistry(self.ld.root / "models",
+                                    os.environ.get("AD_WEIGHTS_BASE") or ecfg["ad_weights"])
+        self.job = RetrainJob(self.ld.root, self.models.current_weights)
+        self.scanner = None
+        if L["scan"]:
+            sc = BrandScanner(self.library, {"threads": L["scan_threads"],
+                                             "exclude_boxes": parse_boxes(ecfg.get("motion_exclude_boxes"))},
+                              reviews=self.reviews, samples=self.samples if L["samples"] else None,
+                              learn_root=self.ld.root)
+            self.scanner = sc if sc.available else None
+        self.engine = None
+        self.api = None
+        if L["operator_token"]:
+            from operator_api import OperatorAPI
+            self.api = OperatorAPI(L["operator_token"], self.ld, self.library, self.reviews,
+                                   self.samples, self.snapshots, self.clock, lambda: self.engine,
+                                   self.models, self.job, self.swap_model)
+        self._last_prune = 0.0
+        self._last_auto = 0.0
+        log("learn", f"learning data in {self.ld.root}: {len(self.library.brands)} brands in the "
+                     f"library, {self.samples.summary()['total']} training frames; brand scan "
+                     f"{'on' if self.scanner else 'off'}; operator page "
+                     f"{'on' if self.api else 'off (set OPERATOR_TOKEN)'}; model in use: "
+                     f"{self.models.status()['current']}")
+
+    def swap_model(self, weights: str) -> bool:
+        """Load another board model beside the running one, then switch the
+        engine over between two frames: no restart, no gap in the stream."""
+        eng = self.engine
+        if eng is None:
+            return False
+
+        def work():
+            try:
+                from render_engine import BoardDetector
+                cfg = dict(eng.cfg)
+                cfg["ad_weights"] = runtime_weights(weights)
+                det = BoardDetector(cfg)
+                det(np.zeros((eng.h, eng.w, 3), np.uint8))          # warm up off the frame loop
+                eng.detector = det
+                log("learn", f"board model switched to {cfg['ad_weights']}")
+            except Exception as exc:
+                log("learn", f"model switch failed ({type(exc).__name__}: {exc}); "
+                             f"the current model stays")
+        threading.Thread(target=work, name="model-swap", daemon=True).start()
+        return True
+
+    def tick(self, idle_s: float) -> None:
+        """Housekeeping, from the main loop's status tick."""
+        from learn_store import prune_recordings
+        now = time.monotonic()
+        if self.record_dir and now - self._last_prune > 600:
+            self._last_prune = now
+            freed = prune_recordings(Path(self.record_dir), float(self.cfg["original_max_gb"]))
+            if freed:
+                log("learn", f"deleted {freed / 1e9:.1f} GB of the oldest original recordings")
+        mode = str(self.cfg["auto_train"]).strip().lower()
+        due = False
+        if mode == "idle":
+            due = idle_s > 60 * float(self.cfg["idle_minutes"]) and now - self._last_auto > 3600
+        elif mode.startswith("daily@"):
+            try:
+                hh, mm = (int(x) for x in mode[6:].split(":"))
+            except ValueError:
+                hh = mm = -1
+            utc = time.gmtime()
+            today = time.strftime("%Y%m%d", utc)
+            due = (0 <= hh < 24 and (utc.tm_hour, utc.tm_min) >= (hh, mm)
+                   and getattr(self, "_daily_done", None) != today)
+            if due:
+                self._daily_done = today
+        if due and not self.job.running():
+            last = {}
+            try:
+                last = json.loads((self.ld.root / "jobs" / "last_train.json").read_text())
+            except (OSError, ValueError):
+                pass
+            new = self.samples.summary()["total"] - int(last.get("samples_total", 0))
+            if new >= int(self.cfg["min_new_samples"]):
+                self._last_auto = now
+                log("learn", f"{'input idle for %.0f min' % (idle_s / 60) if mode == 'idle' else mode}"
+                             f" and {new} new training frames: starting a retraining run")
+                self.job.start()
+
+    def summary(self) -> dict:
+        return {"brands": len(self.library.brands), "review": len(self.reviews.pending()),
+                "samples": self.samples.summary()["total"],
+                "model": self.models.status()["current"], "training": self.job.running()}
+
+    def close(self) -> None:
+        if self.scanner is not None:
+            self.scanner.close()
+        self.reviews.save()
 
 
 # ---------------------------------------------------------------------- main
@@ -773,6 +1012,7 @@ def main() -> int:
         return 0
 
     from render_engine import AdBlockEngine
+    learn = Learning(s, ecfg) if s["learn"]["enabled"] else None
     http_root: Path | None = Path(s["http_root"])
     try:
         http_root.mkdir(parents=True, exist_ok=True)
@@ -783,10 +1023,15 @@ def main() -> int:
         player = ROOT / "deploy" / "web" / "player.html"
         if player.exists():
             shutil.copy(player, http_root / "index.html")
+        operator = ROOT / "deploy" / "web" / "operator.html"
+        if learn is not None and learn.api is not None and operator.exists():
+            shutil.copy(operator, http_root / "operator.html")
         if int(s["http_port"]) > 0:
-            serve_http(http_root, int(s["http_port"]), str(s.get("http_token") or ""))
+            serve_http(http_root, int(s["http_port"]), str(s.get("http_token") or ""),
+                       api=learn.api if learn is not None else None)
     links = {"stream": served_path(s["output"], http_root),
-             "compare": served_path(s["compare_output"], http_root) if s["compare"] else None}
+             "compare": served_path(s["compare_output"], http_root) if s["compare"] else None,
+             "operator": bool(learn is not None and learn.api is not None)}
 
     def write_status(st: dict) -> None:
         if http_root is None:
@@ -807,13 +1052,16 @@ def main() -> int:
     frames_q: queue.Queue = queue.Queue(maxsize=cap)
     audio_q: queue.Queue = queue.Queue(maxsize=20000)
     video_q: queue.Queue = queue.Queue(maxsize=64)          # engine -> egress
-    ingest = Ingest(s, frames_q, audio_q, stats)
-    egress = Egress(s, video_q, audio_q, stats)
+    ingest = Ingest(s, frames_q, audio_q, stats,
+                    record_dir=learn.record_dir if learn is not None else None)
+    egress = Egress(s, video_q, audio_q, stats, clock=learn.clock if learn is not None else None)
     ingest.start()
     egress.start()
 
     engine = None
     geometry = None
+    generation = 0
+    last_frame_at = time.monotonic()
     base_det = cur_det = int(ecfg["det_interval"])
     last_adapt = last_status = t_start = time.monotonic()
     last_in = last_out = 0
@@ -838,7 +1086,13 @@ def main() -> int:
                     log("engine", f"loading models for {g[0]}x{g[1]} "
                                   f"(ad={ecfg['ad_weights']} person={ecfg['person_weights']})")
                     engine = AdBlockEngine(ecfg, g[0], g[1], live=True, debug=args.debug,
-                                           fps=info["fps"])
+                                           fps=info["fps"],
+                                           library=learn.library if learn is not None else None,
+                                           scanner=learn.scanner if learn is not None else None)
+                    generation += 1
+                    engine.generation = generation
+                    if learn is not None:
+                        learn.engine = engine
                     engine.warmup()
                     engine.start_async(video_q)
                     geometry = g
@@ -848,6 +1102,10 @@ def main() -> int:
                 continue
             if item is not None and engine is not None:
                 _, img, t_out, t_recv, small = item
+                last_frame_at = time.monotonic()
+                if learn is not None:
+                    # the ORIGINAL picture, for the operator to mark logos on
+                    learn.snapshots.offer(engine.idx, img, t_out, engine.generation)
                 engine.push(img, meta=(t_out, t_recv, small))
 
             now = time.monotonic()
@@ -873,13 +1131,16 @@ def main() -> int:
                           det_interval=cur_det, processing_latency_s=round(lat, 2),
                           engine_ms=(engine.timing if engine else {}), **stats,
                           tracks=(len(engine.tracker.tracks) if engine else 0), **links,
-                          recording=served_file(egress.recording, http_root))
+                          recording=served_file(egress.recording, http_root),
+                          learning=learn.summary() if learn is not None else None)
                 log("status", f"in {st['fps_in']} fps, out {st['fps_out']} fps, queue {st['queue']}, "
                               f"det/{cur_det}, latency {lat:.2f}s, dropped {stats['dropped']}, "
                               f"reconnects {stats['reconnects']} | "
                               + (engine.timing_summary() if engine else "no input yet"))
                 write_status(st)
                 last_status, last_in, last_out = now, fin, fout
+                if learn is not None:
+                    learn.tick(now - last_frame_at)
     finally:
         # Order matters: stop the input, let the engine drain through the
         # still-running egress, then end the output with the sentinel.
@@ -887,6 +1148,8 @@ def main() -> int:
         if engine is not None:
             engine.flush(timeout=15)
             engine.close()
+        if learn is not None:
+            learn.close()
         video_q.put(None)
         egress.join(timeout=20)
         ingest.join(timeout=5)

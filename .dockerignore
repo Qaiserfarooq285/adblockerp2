@@ -5,6 +5,8 @@ runs/
 outputs/
 logs/
 input/
+learning/*
+!learning/README.md
 notebooks/
 **/__pycache__
 *.pyc

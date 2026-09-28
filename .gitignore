@@ -31,3 +31,8 @@ config.local.yaml
 *.pem
 *.key
 .env
+
+# Learning data (brand library, training frames, original recordings, model
+# versions): it lives on the pod's volume; only the folder's README is committed
+learning/*
+!learning/README.md

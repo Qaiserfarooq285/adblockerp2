@@ -36,6 +36,7 @@ HTTP_PORT = 8080
 POD_ENV = ("INPUT_URL", "OUTPUT_URL", "HTTP_TOKEN", "AD_WEIGHTS_URL", "USE_TENSORRT",
            "DET_INTERVAL", "ENCODER", "VIDEO_BITRATE", "DEVICE", "LIVE_CONFIG",
            "RECORD", "RECORD_DIR", "COMPARE", "COMPARE_OUTPUT", "HTTP_ROOT",
+           "OPERATOR_TOKEN", "LEARN", "LEARN_DIR", "SCAN", "RECORD_ORIGINAL", "AUTO_TRAIN",
            "REPO_URL", "REPO_REF")
 
 
@@ -87,7 +88,7 @@ def pod_body(env: dict, bootstrap: bool) -> dict:
         "gpuTypeIds": gpus,
         "gpuTypePriority": "custom",           # try them in the order listed
         "containerDiskInGb": int(env.get("CONTAINER_DISK_GB", 40)),
-        "volumeInGb": int(env.get("VOLUME_GB", 30)),
+        "volumeInGb": int(env.get("VOLUME_GB", 60)),
         "volumeMountPath": "/workspace",
         "ports": [f"{HTTP_PORT}/http", "22/tcp"],
         "minVCPUPerGPU": int(env.get("MIN_VCPU", 8)),
@@ -117,7 +118,8 @@ def pod_body(env: dict, bootstrap: bool) -> dict:
 def urls(pod_id: str, env: dict) -> dict:
     tok = env.get("HTTP_TOKEN", "").strip("/")
     base = f"https://{pod_id}-{HTTP_PORT}.proxy.runpod.net" + (f"/{tok}" if tok else "")
-    return {"player": base + "/", "hls": base + "/out/index.m3u8", "status": base + "/status.json"}
+    return {"player": base + "/", "operator": base + "/operator.html",
+            "hls": base + "/out/index.m3u8", "status": base + "/status.json"}
 
 
 def main() -> int:
@@ -140,7 +142,7 @@ def main() -> int:
         body = pod_body(env, args.bootstrap)
         if args.dry_run:
             shown = json.loads(json.dumps(body))
-            for k in ("HTTP_TOKEN", "AD_WEIGHTS_URL"):
+            for k in ("HTTP_TOKEN", "AD_WEIGHTS_URL", "OPERATOR_TOKEN"):
                 if k in shown.get("env", {}):
                     shown["env"][k] = "***"
             print(json.dumps({"POST": API + "/pods", "body": shown}, indent=1))

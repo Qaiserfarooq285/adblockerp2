@@ -23,6 +23,12 @@ D frames of latency is nothing next to HLS delivery (~30 s end to end) and is
 irrelevant for files.  With delay_frames=0 the engine degrades gracefully to a
 causal tracker.
 
+With a Brand Library (brand_library.py) every board's verdict follows the
+operator's decisions, re-read the moment they change; with a BrandScanner
+(brand_scan.py) boards the model does not know are found by reading them,
+carried from the scanned frame to the present through the camera
+homographies, and tracked like the rest.
+
 v2_render.py uses this for files (--tracker homography, the default) and
 live_stream.py for live streams; both see exactly the same behaviour.
 """
@@ -40,7 +46,7 @@ import numpy as np
 
 from board_tracker import BoardTrack, BoardTracker, TrackerConfig
 from geometry import (CameraMotionEstimator, Motion, OnlineOverlayEstimator,
-                      quad_axes, visible_fraction, warp_quad)
+                      containment, convex_iou, quad_axes, visible_fraction, warp_quad)
 from v2_render import (PAINT_COLOR_BGR, _crop_for_guard, _get_ocr, _ocr_texts,
                        canonical, crossing_structure, merge_overlapping, pitch_mask,
                        pitch_reference, quad_from_mask, quad_shape, strips_from_frame)
@@ -65,6 +71,28 @@ def parse_imgsz(v):
 def _device(v):
     v = str(v).strip()
     return None if v in ("", "auto", "None") else v
+
+
+_QUANTIZE = None
+
+
+def precision(half: bool) -> dict:
+    """FP16 inference as the installed Ultralytics spells it.
+
+    8.4 folded `half` into `quantize=16`; `half` still works there but logs a
+    deprecation warning on EVERY predict call -- two models, 30 fps: about 60
+    log lines a second on a live stream.  Older versions only know `half`.
+    """
+    global _QUANTIZE
+    if _QUANTIZE is None:
+        try:
+            from ultralytics.cfg import DEFAULT_CFG_DICT
+            _QUANTIZE = "quantize" in DEFAULT_CFG_DICT
+        except Exception:
+            _QUANTIZE = False
+    if _QUANTIZE:
+        return {"quantize": 16 if half else None}
+    return {"half": bool(half)}
 
 
 def parse_boxes(v) -> list[list[float]]:
@@ -99,17 +127,26 @@ class BoardDetector:
         self.max_thick_frac = float(cfg["max_thick_frac"])
         self.device = _device(cfg.get("device", ""))
         self.half = bool(int(cfg.get("half", 1)))
+        # Single-class models: every mask is a betting board.  Two-class
+        # models (learn_retrain.py, once it has enough data): betting_ad and
+        # other_ad -- any other advert, painted only if its brand is hidden.
+        names = getattr(self.model, "names", None) or {0: "betting_ad"}
+        self.other = {int(k) for k, v in dict(names).items() if "bet" not in str(v).lower()}
+        if len(self.other) == len(names):
+            self.other = set()
 
-    def __call__(self, frame: np.ndarray) -> list[tuple[np.ndarray, float]]:
+    def __call__(self, frame: np.ndarray) -> list[tuple[np.ndarray, float, int]]:
         h, w = frame.shape[:2]
         res = self.model.predict(frame, conf=self.conf, imgsz=self.imgsz, verbose=False,
-                                 retina_masks=True, device=self.device, half=self.half)[0]
+                                 retina_masks=True, device=self.device, **precision(self.half))[0]
         if res.masks is None or res.boxes is None or len(res.boxes) == 0:
             return []
         masks = res.masks.data.gt(0.5).byte().cpu().numpy()
         confs = res.boxes.conf.cpu().numpy()
-        raw, cf = [], []
-        for mk, c in zip(masks, confs):
+        classes = (res.boxes.cls.cpu().numpy().astype(int) if getattr(res.boxes, "cls", None) is not None
+                   else np.zeros(len(confs), int))
+        raw, cf, kinds = [], [], []
+        for mk, c, k in zip(masks, confs, classes):
             mm = mk if mk.shape == (h, w) else cv2.resize(mk, (w, h), interpolation=cv2.INTER_NEAREST)
             q = quad_from_mask(mm)
             if q is None:
@@ -119,6 +156,7 @@ class BoardDetector:
                 continue
             raw.append(mm)
             cf.append(float(c))
+            kinds.append(1 if int(k) in self.other else 0)
         kept = merge_overlapping(raw, cf)
         conf_of = max((g["conf"] for g in kept), default=0.0)
         out = []
@@ -131,7 +169,8 @@ class BoardDetector:
             # track *birth* (trk_birth_conf), never sustaining a known board.
             cx, cy = np.clip(q.mean(axis=0), [0, 0], [w - 1, h - 1]).astype(int)
             c = max((g["conf"] for g in kept if g["mask"][cy, cx]), default=conf_of)
-            out.append((q, float(c)))
+            k = max(((cf[i], kinds[i]) for i, m in enumerate(raw) if m[cy, cx]), default=(0.0, 0))[1]
+            out.append((q, float(c), int(k)))
         return out
 
 
@@ -230,7 +269,7 @@ class PersonProtector:
             crop = np.ascontiguousarray(frame[ry0:ry1, rx0:rx1])
             r = self.model.predict(crop, conf=self.conf, imgsz=self._imgsz(rx1 - rx0, ry1 - ry0),
                                    classes=[0], verbose=False, retina_masks=False,
-                                   device=self.device, half=self.half)[0]
+                                   device=self.device, **precision(self.half))[0]
             if r.masks is not None:
                 cur = np.zeros((ry1 - ry0, rx1 - rx0), np.uint8)
                 off = np.float32([rx0, ry0])
@@ -338,9 +377,8 @@ class StaticProtection:
 
 # ------------------------------------------------------------------------ OCR
 
-def ocr_verdict(crop: np.ndarray) -> str:
+def builtin_verdict(texts: list[str]) -> str:
     """'bet' | 'neg' | 'unknown' -- the same precedence as v2_render.is_betting_board."""
-    texts = _ocr_texts(crop)
     if not texts:
         return "unknown"
     from v2_brands import is_betting, is_non_betting
@@ -351,13 +389,17 @@ def ocr_verdict(crop: np.ndarray) -> str:
     return "unknown"
 
 
+def ocr_verdict(crop: np.ndarray) -> str:
+    return builtin_verdict(_ocr_texts(crop))
+
+
 class OcrWorker:
     """Brand OCR off the frame loop (live) or inline (files, deterministic)."""
 
     def __init__(self, async_mode: bool):
         self.available = _get_ocr() is not None
         self.async_mode = async_mode and self.available
-        self.results: "queue.Queue[tuple[int, str]]" = queue.Queue()
+        self.results: "queue.Queue[tuple[int, list[str]]]" = queue.Queue()
         self.jobs: "queue.Queue" = queue.Queue(maxsize=16)
         self._t = None
         if self.async_mode:
@@ -368,7 +410,7 @@ class OcrWorker:
         if not self.available:
             return False
         if not self.async_mode:
-            self.results.put((tid, ocr_verdict(crop)))
+            self.results.put((tid, _ocr_texts(crop)))
             return True
         try:
             self.jobs.put_nowait((tid, crop))
@@ -376,7 +418,7 @@ class OcrWorker:
         except queue.Full:
             return False
 
-    def poll(self) -> list[tuple[int, str]]:
+    def poll(self) -> list[tuple[int, list[str]]]:
         out = []
         while True:
             try:
@@ -390,10 +432,10 @@ class OcrWorker:
             if tid is None:
                 return
             try:
-                v = ocr_verdict(crop)
+                texts = _ocr_texts(crop)
             except Exception:
-                v = "unknown"
-            self.results.put((tid, v))
+                texts = []
+            self.results.put((tid, texts))
 
     def close(self) -> None:
         if self._t is not None:
@@ -430,8 +472,11 @@ class AdBlockEngine:
     def __init__(self, cfg: dict, width: int, height: int,
                  overlay_mask: np.ndarray | None = None, live: bool = False,
                  debug: bool = False, panel_log: str | None = None,
-                 detector=None, person_model=None, fps: float = 30.0):
-        """`detector` / `person_model` override the YOLO models (tests, dry runs)."""
+                 detector=None, person_model=None, fps: float = 30.0,
+                 library=None, scanner=None):
+        """`detector` / `person_model` override the YOLO models (tests, dry runs).
+        `library`: a brand_library.BrandLibrary deciding every verdict;
+        `scanner`: a brand_scan.BrandScanner finding boards the model misses."""
         self.cfg = cfg
         self.w, self.h = int(width), int(height)
         self.debug = debug
@@ -483,6 +528,21 @@ class AdBlockEngine:
         tc = self.tracker.cfg
         tc.history = max(tc.history, self.delay + self.max_backlog + 16)
 
+        self.library = library
+        self._lib_version = library.version if library is not None else None
+        self.scanner = scanner if scanner is not None and scanner.available else None
+        self.scan_every = max(1, int(cfg.get("scan_every", 30)))
+        self.scan_anchor = max(1, int(cfg.get("scan_anchor", 90)))
+        self.hide_unknown = bool(int(cfg.get("hide_unknown", 0)))
+        self._last_scan = -10 ** 9
+        self._scan_due = 0
+        # camera motion per frame (H from frame-1 to frame, cut flag): carries
+        # a board read on an older frame -- a scan, an operator's mark -- to now
+        self.mhist: dict[int, tuple[np.ndarray | None, bool]] = {}
+        self.mhist_len = int(30 * fps)
+        self._ext: list[tuple[int, np.ndarray, str, str | None, str]] = []
+        self.generation = 0          # bumped by the caller when an engine is replaced
+
     # -- public API -----------------------------------------------------------
 
     def warmup(self) -> None:
@@ -491,7 +551,7 @@ class AdBlockEngine:
         self.detector(dummy)
         self.people.model.predict(dummy[: self.h // 3], conf=0.5, classes=[0], verbose=False,
                                   imgsz=self.people._imgsz(self.w, self.h // 3),
-                                  device=self.people.device, half=self.people.half)
+                                  device=self.people.device, **precision(self.people.half))
 
     def start_async(self, out: "queue.Queue | None" = None) -> "queue.Queue":
         """Render on a background thread (live).
@@ -606,6 +666,8 @@ class AdBlockEngine:
                 self.tracker.reset(t)
                 self.stats["cuts"] += int(motion.cut)
                 self._force_cut = False
+            self.mhist[t] = (motion.H, bool(shot_start))
+            self.mhist.pop(t - self.mhist_len, None)
         t0 = self._tick("motion", t0)
 
         run_det = shot_start or (t - self._last_det) >= self.det_interval
@@ -620,6 +682,12 @@ class AdBlockEngine:
                 self.stats["det_runs"] += 1
                 self.stats["dets"] += len(dets)
             self.tracker.step(t, motion, dets)
+            if self.library is not None and self.library.version != self._lib_version:
+                self._apply_library()
+            if self._ext:
+                self._apply_marks(t)
+            if self.scanner is not None:
+                self._scan(frame, t, shot_start)
             self._ocr_schedule(frame, t)
             if self.overlay_est is not None:
                 self.overlay_est.update(frame, motion)
@@ -657,12 +725,23 @@ class AdBlockEngine:
         if not self.ocr.async_mode:
             self._ocr_apply(t, retry, recheck, max_attempts)
 
+    def brand_verdict(self, texts: list[str]) -> tuple[str, str | None]:
+        if self.library is not None:
+            return self.library.verdict(texts)
+        v = builtin_verdict(texts)
+        return v, ("builtin" if v != "unknown" else None)
+
     def _ocr_apply(self, t: int, retry: int, recheck: int, max_attempts: int) -> None:
-        for tid, verdict in self.ocr.poll():
+        for tid, texts in self.ocr.poll():
             tr = self.tracker.find(tid)
             if tr is None:
                 continue
             tr.ocr_pending = False
+            if texts:
+                tr.ocr_texts = list(texts)
+            verdict, brand = self.brand_verdict(texts)
+            if brand is not None:
+                tr.brand = brand
             if verdict == "bet":
                 tr.verdict = "bet"
                 tr.ocr_next = t + recheck
@@ -679,12 +758,162 @@ class AdBlockEngine:
                     tr.verdict = "unknown"     # fail-open, as the per-frame guard was
                 tr.ocr_next = t + (retry if tr.ocr_attempts < max_attempts else recheck)
 
+    # -- brand library, scan, operator marks ---------------------------------
+
+    def _set_verdict(self, tr: BoardTrack, verdict: str, brand: str | None) -> None:
+        if verdict == "neg" and tr.verdict != "neg":
+            self.stats["suppressed"] += 1
+        tr.verdict, tr.brand = verdict, brand
+
+    def _apply_library(self) -> None:
+        """The operator changed the Brand Library: re-decide every board from
+        what was read on it, at once -- no new OCR needed."""
+        self._lib_version = self.library.version
+        self.stats["library_updates"] += 1
+        for tr in self.tracker.tracks:
+            if not tr.alive:
+                continue
+            if tr.ocr_texts:
+                v, b = self.library.verdict(tr.ocr_texts)
+                if v != "unknown" or tr.brand not in (None, "builtin"):
+                    self._set_verdict(tr, v, b)
+            elif tr.source != "model" and tr.brand not in (None, "builtin"):
+                b = self.library.brands.get(tr.brand)
+                if b is None or b["action"] != "hide":
+                    # the brand that put this board up was removed or kept
+                    self._set_verdict(tr, "neg", tr.brand)
+                    tr.anchor_until = None
+
+    def _map_quad(self, src: int, dst: int, quad: np.ndarray) -> np.ndarray | None:
+        """A quad on frame `src` carried to frame `dst` (>= src), or None
+        across a cut or a frame whose motion could not be measured."""
+        q = np.asarray(quad, np.float32).reshape(4, 2)
+        for k in range(src + 1, dst + 1):
+            H, cut = self.mhist.get(k, (None, True))
+            if cut or H is None:
+                return None
+            q = warp_quad(H, q)
+            if q is None:
+                return None
+        return q
+
+    def mark(self, frame_idx: int, quad: np.ndarray, verdict: str, brand: str | None,
+             generation: int | None = None) -> bool:
+        """Operator marked a board on frame `frame_idx` (thread-safe).  Applied
+        on the next analysed frame, if the shot has not changed since."""
+        if generation is not None and generation != self.generation:
+            return False
+        with self._lock:
+            if frame_idx not in self.mhist and frame_idx != self.idx:
+                return False
+            self._ext.append((int(frame_idx), np.asarray(quad, np.float32).reshape(4, 2),
+                              verdict, brand, "operator"))
+        return True
+
+    def _inject(self, t: int, src: int, quad, verdict: str, brand, source: str) -> bool:
+        q = self._map_quad(src, t, quad)
+        if q is None or visible_fraction(q, self.w, self.h) < 0.02:
+            self.stats["inject_dropped"] += 1
+            return False
+        tr = self.tracker.inject(t, q, verdict, brand, self.scan_anchor, source)
+        if tr is not None:
+            self.stats[f"inject_{source}"] += 1
+        return tr is not None
+
+    def _apply_marks(self, t: int) -> None:
+        marks, self._ext = self._ext, []
+        for src, q, verdict, brand, source in marks:
+            self._inject(t, src, q, verdict, brand, source)
+
+    def _scan(self, frame: np.ndarray, t: int, shot_start: bool) -> None:
+        """Hand a frame to the brand scan when due; apply finished scans."""
+        if shot_start:
+            self._scan_due = t + 2               # a new shot: read it right away
+        due = t >= self._scan_due or t - self._last_scan >= self.scan_every
+        if due and self.scanner.idle():
+            tracks = [{"tid": tr.id, "quad": tr.quad.copy(), "verdict": tr.verdict,
+                       "model_bet": tr.model_bet, "conf": tr.conf}
+                      for tr in self.tracker.tracks if tr.alive and tr.confirmed_frame is not None]
+            if self.scanner.submit(t, frame.copy(), tracks, self.overlay):
+                self._last_scan = t
+                self._scan_due = t + self.scan_every
+        for res in self.scanner.poll():
+            src = int(res["idx"])
+            self._scan_lapse(t, res)
+            hide = []
+            for b in res["boards"]:
+                if b["label"] == "hide":
+                    self._inject(t, src, b["quad"], "bet", b["brand"], b["by"])
+                    q = self._map_quad(src, t, b["quad"])
+                    if q is not None:
+                        hide.append(q)
+            for b in res["boards"]:
+                if b["label"] != "keep":
+                    continue
+                # A sponsor that must stay, read where a board is tracked: that
+                # board is not (or no longer: the LED rotated) a betting ad --
+                # unless this very read also found a betting name on it, which
+                # wins, as everywhere else.
+                q = self._map_quad(src, t, b["quad"])
+                if q is None:
+                    continue
+                for tr in self.tracker.tracks:
+                    if not tr.alive or tr.verdict == "neg":
+                        continue
+                    if convex_iou(q, tr.quad) < 0.3 and containment(tr.quad, q) < 0.5:
+                        continue
+                    if any(convex_iou(hq, tr.quad) > 0.1 or containment(hq, tr.quad) > 0.3
+                           for hq in hide):
+                        continue
+                    self._set_verdict(tr, "neg", b["brand"])
+                    tr.anchor_until = None
+
+    def _scan_lapse(self, t: int, res: dict) -> None:
+        """A board only the scan keeps up, which this scan looked at and did
+        not see again, ends soon: the LED rotated, or the shot changed in a
+        way the cut detector missed.  Another sponsor read in its place ends
+        it at once; plain silence (blur, a player in front) needs two scans."""
+        seen = {tr["tid"]: tr["quad"] for tr in res.get("tracks", [])}
+        hides = [b["quad"] for b in res["boards"] if b["label"] == "hide"]
+        others = [r["quad"].mean(axis=0) for r in res["texts"] if r["cls"] != "bet"]
+        for tr in self.tracker.tracks:
+            q = seen.get(tr.id)
+            if not tr.alive or tr.anchor_until is None or q is None:
+                continue
+            if visible_fraction(q, self.w, self.h) < 0.9:
+                continue                               # partly off screen: no verdict
+            if any(convex_iou(h, q) > 0.2 or containment(h, q) > 0.5 for h in hides):
+                continue                               # still there (inject renews it)
+            replaced = any(cv2.pointPolygonTest(q.reshape(-1, 1, 2).astype(np.float32),
+                                                (float(c[0]), float(c[1])), False) >= 0
+                           for c in others)
+            tr.scan_misses += 1
+            if replaced or tr.scan_misses >= 2:
+                tr.anchor_until = min(tr.anchor_until, t)
+                self.stats["scan_lapsed"] += 1
+
+    def learning_status(self) -> dict:
+        with self._lock:
+            tr = [t for t in self.tracker.tracks if t.alive]
+            return {"tracks": len(tr),
+                    "hidden": sum(1 for t in tr if t.confirmed_frame is not None and self._drawable(t, self.idx)),
+                    "from_scan": sum(1 for t in tr if t.source != "model"),
+                    "injected": {k[7:]: v for k, v in self.stats.items() if k.startswith("inject_")},
+                    "scan": dict(self.scanner.stats) if self.scanner is not None else None}
+
     # -- render (frame t - D) -------------------------------------------------
 
     def _drawable(self, tr: BoardTrack, now: int) -> bool:
         if tr.confirmed_frame is None or tr.verdict == "neg":
             return False
-        if tr.verdict in ("bet", "unknown") or self.ocr is None or not self.ocr.available:
+        if tr.verdict == "bet":
+            return True
+        if tr.last_model_frame is not None and not tr.model_bet:
+            # A two-class model's "some other advert": hidden only when its
+            # brand is (above), or by policy once OCR has had its tries.
+            return (self.hide_unknown and tr.verdict == "unknown"
+                    and tr.ocr_attempts >= int(self.cfg["ocr_max_attempts"]))
+        if tr.verdict == "unknown" or self.ocr is None or not self.ocr.available:
             return True
         return (now - tr.birth_frame) >= int(self.cfg["ocr_wait"])
 
@@ -816,14 +1045,18 @@ class AdBlockEngine:
         return frame
 
     def _draw_debug(self, frame: np.ndarray, slot: Slot, panels: list[Panel]) -> None:
-        colours = {"det": (0, 255, 0), "coast": (0, 165, 255), "backfill": (255, 255, 0)}
+        colours = {"det": (0, 255, 0), "coast": (0, 165, 255), "backfill": (255, 255, 0),
+                   "scan": (255, 0, 255)}
         drawn = set()
         for p in panels:
             drawn.add(p.tid)
             q = np.round(p.quad).astype(np.int32)
-            cv2.polylines(frame, [q], True, colours[p.kind], 2, cv2.LINE_AA)
-            cv2.putText(frame, f"{p.tid}{p.kind[0]}", tuple(q[0]), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, colours[p.kind], 1, cv2.LINE_AA)
+            tr = self.tracker.find(p.tid)
+            col = colours["scan"] if tr is not None and tr.source != "model" else colours[p.kind]
+            cv2.polylines(frame, [q], True, col, 2, cv2.LINE_AA)
+            label = f"{p.tid}{p.kind[0]}" + (f" {tr.brand}" if tr is not None and tr.brand else "")
+            cv2.putText(frame, label, tuple(q[0]), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, col, 1, cv2.LINE_AA)
         for tr in self.tracker.all_for_render():
             q = tr.history.get(slot.idx)
             if tr.id in drawn or q is None:

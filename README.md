@@ -94,6 +94,10 @@ Large generated artifacts (`data/`, `models/`, `runs/`, `outputs/`, `logs/`, `in
 | `board_tracker.py` | Board tracks carried by the camera homography and corrected by each detection (Kalman, across/along the rail) |
 | `geometry.py` | Frame-to-frame homography (masked, FB-checked LK + MAGSAC), cut detection, live overlay estimate |
 | `live_stream.py` | Live pipeline: HLS/SRT/RTMP in → engine → NVENC/x264 → HLS/RTMP/SRT out, with A/V sync and reconnects |
+| `brand_library.py` | The Brand Library: brands to hide / keep, edited live on the operator page, overriding the built-in lists |
+| `brand_scan.py` | Reads every board ~1/s, so brands the model has not learned are hidden as soon as the library names them |
+| `operator_api.py` | The operator page's API: mark a logo on a paused frame, decide new sponsors, switch model versions |
+| `learn_retrain.py` | Trains the next model version from the collected frames and recordings, tests it, promotes it only if it passes |
 | `export_tensorrt.py` | Builds TensorRT FP16 engines on the GPU that will run them |
 | `stability_report.py` | Scores a render for panel movement relative to the scene and blinks (old vs. new tracker) |
 | `v2_verify.py` | Measures the actual rendered output against the original (OCR + person-overlap), rather than trusting the renderer's own claims |
@@ -158,6 +162,44 @@ python scripts/live_stream.py --input match.mp4 --loop --output hls:///tmp/live/
 Every processed match is also saved on the pod's volume (`/workspace/live/recordings/`, about 2.7 GB per hour at 6 Mbps) from the same encode as the live stream, and a failed recording never interrupts the live output. With `OUTPUT_URL` set to an RTMP/SRT address (for example Tulix's ingest), the page still serves the side-by-side view and the recordings. `RECORD=0` / `COMPARE=0` turn either off.
 
 Pick a GPU with a hardware encoder (NVENC): RTX 4090, L40S, RTX A6000, L4. A100 and H100 have none; there the encoder falls back to CPU x264.
+
+## Teaching it new brands (operator page)
+
+The model hides the brands it was trained on. A betting brand it has never seen is taught on the operator page, with no labelling work, in two speeds:
+
+```
+DURING THE MATCH (about a second, no training)
+  every board ─► read its name (OCR, ~1/s) + compare its picture ─► Brand Library ─► hide / keep
+                                                                  └─ unknown sponsor ─► page asks: Hide | Keep
+  operator pauses, picks the frame, draws a box ──────────────────────────────────► added to the library
+
+AFTER THE MATCH (automatic)
+  original recordings + saved frames ─► labelled with the library ─► synthetic views of each new logo
+  ─► fine-tune the model in use ─► test against it ─► new version, used only if it passes
+```
+
+**Set it up:** put `OPERATOR_TOKEN=<a long password>` in `deploy/runpod/.env` (it becomes the page's password, separate from the viewer link, because it controls what goes on air). The page is at `https://<POD_ID>-8080.proxy.runpod.net/<HTTP_TOKEN>/operator.html`.
+
+**On the page:**
+- **New sponsors seen**: names the scan read on the boards that are in no list yet, with a picture. *Hide*, *Keep* or *Not a sponsor*; the decision applies at once and is remembered.
+- **Pause & mark a logo**: freezes the player, shows the original frames around that moment, and you drag a box around the logo. *Hide this logo* or *Keep it*. The name is read from the box; a logo with no readable name is matched by its picture instead.
+- **Brand list**: add brands by name before kick-off (tournament sponsors are usually known in advance), switch hide/keep, remove.
+- **Learning**: training frames collected, the model in use, *Train a new model now*, and every version with *Use this model* / *Back to the original model* (switched between two frames, no restart).
+
+**What happens underneath:**
+- `brand_library.py` keeps the decisions in `<LEARN_DIR>/brands.json`; they override the built-in lists (`v2_brands.py`), and every tracked board is re-decided the moment the library changes.
+- `brand_scan.py` reads the whole picture about once a second off the frame loop. A board carrying a hidden brand is found from the text, grown to the edges of its artwork along the rail (never over another sponsor's name), carried to the present through the camera homographies, and tracked like any other; the next reading refreshes it, and a board the scan stops seeing ends within two readings (an LED rotating to another advert). The live look-ahead is 1.2 s, so a brand read ~1 s into a shot is still painted from the shot's first frame.
+- The same frames become training data (`<LEARN_DIR>/samples/`): boards the model missed, boards it flagged but that carry a sponsor to keep, and what it already gets right, plus the original feed (`recordings/`, ~1.5 GB/h, oldest deleted beyond 15 GB).
+- `learn_retrain.py` runs after the match (`AUTO_TRAIN=idle`: once the input has been down 20 minutes; `daily@04:00`; or the button). It re-reads the original recordings with today's library, so a brand added today is also labelled in earlier matches; paints each new logo onto real boards for synthetic views; fine-tunes the model in use on old and new labels together (the model's own confident detections are part of the data, so it does not forget Betano); and tests old against new on held-out sessions. A version is promoted only if it hides at least as many known betting boards, covers no more sponsors that must stay, and finds the new brands clearly better. Nothing is overwritten: every version is kept in `<LEARN_DIR>/models/`, and `start.sh` loads the promoted one at the next start.
+
+```bash
+python scripts/learn_retrain.py --learn-dir /workspace/learning            # by hand, on the pod
+python scripts/learn_retrain.py --learn-dir /workspace/learning --status
+python scripts/learn_retrain.py --learn-dir /workspace/learning --activate original   # roll back
+python scripts/v2_render.py --input clip.mp4 --brands learning/brands.json --scan 1   # files, same rules
+```
+
+**Limits.** The first time an unregistered brand appears, it is on air until someone clicks (the review list surfaces it within seconds). Until a retrained version has learned a brand, it can show for a fraction of a second after a camera cut while the scan reads it. Logos with no readable name rely on picture matching, which is weaker than reading a name; a few marks from different shots help, and the retraining makes them reliable. Retraining shares the GPU with a live stream if one is running: best after the match.
 
 ## Design notes
 

@@ -1,0 +1,377 @@
+<!doctype html>
+<!-- Served by scripts/live_stream.py next to the player page (operator.html).
+     Every action goes through <root>/api/ with the operator password; the page
+     itself holds no secrets. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ad Blocker Operator</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<style>
+  :root { --bg:#0e1116; --panel:#171b22; --panel2:#1d222b; --line:#262c36; --text:#e6e9ef; --muted:#8b94a3;
+          --ok:#3fb97a; --warn:#e0a43b; --bad:#e5534b; --accent:#4c8dff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; gap:12px; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  h1 { font-size:16px; margin:0; font-weight:600; }
+  h2 { font-size:13px; margin:0 0 8px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  a { color:var(--accent); }
+  button { background:var(--panel2); color:var(--text); border:1px solid var(--line); border-radius:7px; padding:7px 12px; font:inherit; cursor:pointer; }
+  button:hover { border-color:#3a4250; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.hide { background:#3a1d1f; border-color:#6b2c2c; }
+  button.keep { background:#16301f; border-color:#285c39; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  input[type=text], input[type=password] { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:7px; padding:7px 10px; font:inherit; min-width:0; }
+  .wrap { display:grid; grid-template-columns:minmax(0,1fr) 380px; gap:16px; padding:16px; max-width:1700px; margin:0 auto; }
+  @media (max-width:1100px) { .wrap { grid-template-columns:minmax(0,1fr); } }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; min-width:0; }
+  /* minmax(0,1fr): a long strip of frames must scroll, not widen the page */
+  .col { display:grid; grid-template-columns:minmax(0,1fr); gap:16px; align-content:start; min-width:0; }
+  video { width:100%; display:block; background:#000; border-radius:6px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .muted { color:var(--muted); font-size:12px; }
+  .strip { display:flex; gap:6px; overflow-x:auto; padding:6px 0; }
+  .strip img { width:128px; border:2px solid transparent; border-radius:4px; cursor:pointer; flex:none; }
+  .strip img.sel { border-color:var(--accent); }
+  #canvasBox { position:relative; }
+  #cv { width:100%; display:block; border-radius:6px; cursor:crosshair; touch-action:none; background:#000; }
+  .list { display:grid; gap:8px; }
+  .item { background:var(--panel2); border:1px solid var(--line); border-radius:7px; padding:8px; display:grid; gap:6px; }
+  .item img { max-width:100%; border-radius:4px; display:block; }
+  .tag { font-size:11px; padding:1px 6px; border-radius:10px; border:1px solid var(--line); color:var(--muted); }
+  .tag.hide { color:#ff9b93; border-color:#6b2c2c; }
+  .tag.keep { color:#8fe0ad; border-color:#285c39; }
+  .tag.hint { color:var(--warn); border-color:#6b5321; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:13px; }
+  .kv span:nth-child(odd) { color:var(--muted); }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:8px; font-size:11px; max-height:180px; overflow:auto; white-space:pre-wrap; margin:6px 0 0; }
+  #toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:#20262f; border:1px solid var(--line); border-radius:8px; padding:10px 16px; display:none; max-width:90vw; z-index:5; }
+  #login { max-width:420px; margin:12vh auto; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Betting Ad Blocker — operator</h1>
+  <div class="row"><span class="muted" id="modelBadge"></span><a href="./">viewer page</a><button id="logout">Log out</button></div>
+</header>
+
+<div id="login" class="card hidden">
+  <h2>Operator password</h2>
+  <p class="muted">The OPERATOR_TOKEN set on the pod. It is kept only in this browser tab.</p>
+  <div class="row"><input id="pw" type="password" placeholder="password" style="flex:1"><button class="primary" id="pwGo">Enter</button></div>
+  <p class="muted" id="pwMsg"></p>
+</div>
+
+<div class="wrap hidden" id="app">
+  <div class="col">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:8px">
+        <h2 style="margin:0">Live</h2>
+        <div class="row">
+          <label class="muted"><input type="checkbox" id="sbs"> side by side</label>
+          <button class="primary" id="markBtn">Pause &amp; mark a logo</button>
+        </div>
+      </div>
+      <video id="vid" controls muted autoplay playsinline></video>
+    </div>
+
+    <div class="card hidden" id="markCard">
+      <div class="row" style="justify-content:space-between">
+        <h2 style="margin:0">Mark a logo</h2>
+        <button id="backLive">Back to live</button>
+      </div>
+      <p class="muted">Pick the clearest frame, then drag a box around the logo on the ORIGINAL picture.</p>
+      <div class="strip" id="strip"></div>
+      <div id="canvasBox"><canvas id="cv"></canvas></div>
+      <div class="row" style="margin-top:10px">
+        <input type="text" id="markName" placeholder="Brand name (optional: read from the board)" style="flex:1;min-width:200px">
+        <button class="hide" id="markHide" disabled>Hide this logo</button>
+        <button class="keep" id="markKeep" disabled>Keep it (not betting)</button>
+      </div>
+      <p class="muted" id="markMsg"></p>
+    </div>
+  </div>
+
+  <div class="col">
+    <div class="card">
+      <h2>New sponsors seen <span class="muted" id="revCount"></span></h2>
+      <p class="muted">Text on the boards that is not in the brand list yet. Decide once; it applies from then on.</p>
+      <div class="list" id="review"></div>
+    </div>
+
+    <div class="card">
+      <h2>Brand list</h2>
+      <div class="row" style="margin-bottom:8px">
+        <input type="text" id="newName" placeholder="Add by name, as written on the boards" style="flex:1">
+        <button class="hide" id="newHide">Hide</button><button class="keep" id="newKeep">Keep</button>
+      </div>
+      <div class="list" id="brands"></div>
+      <p class="muted">Built in, not listed: Betano, Kalshi, PredictStreet and the registered operators (bet365, Betway, Polymarket…) are hidden; FIFA partners are kept. A brand added here overrides them.</p>
+    </div>
+
+    <div class="card">
+      <h2>Learning</h2>
+      <div class="kv" id="learnKv"></div>
+      <div class="row" style="margin-top:10px">
+        <button id="trainBtn">Train a new model now</button>
+        <span class="muted" id="trainNote"></span>
+      </div>
+      <pre id="jobLog" class="hidden"></pre>
+      <div class="list" id="models" style="margin-top:10px"></div>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+const base = location.pathname.replace(/[^/]*$/, "");
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let token = sessionStorage.getItem("opToken") || "";
+let state = null, status = {}, hls = null;
+
+function toast(msg, ms = 4000) { const t = $("toast"); t.textContent = msg; t.style.display = "block"; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", ms); }
+async function api(path, body) {
+  const r = await fetch(base + "api/" + path, body === undefined
+    ? { headers: { "X-Operator-Token": token }, cache: "no-store" }
+    : { method: "POST", headers: { "X-Operator-Token": token, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (r.status === 401) { showLogin("Wrong or missing password."); throw new Error("unauthorised"); }
+  const ct = r.headers.get("Content-Type") || "";
+  const data = ct.includes("json") ? await r.json() : null;
+  if (!r.ok) throw new Error((data && data.error) || ("HTTP " + r.status));
+  return data;
+}
+function showLogin(msg) { $("app").classList.add("hidden"); $("login").classList.remove("hidden"); $("pwMsg").textContent = msg || ""; }
+$("pwGo").onclick = async () => { token = $("pw").value; sessionStorage.setItem("opToken", token); try { await refresh(); } catch (e) {} };
+$("pw").onkeydown = (e) => { if (e.key === "Enter") $("pwGo").click(); };
+$("logout").onclick = () => { sessionStorage.removeItem("opToken"); token = ""; showLogin(); };
+
+// ---------------------------------------------------------------- video
+function play(src) {
+  const el = $("vid");
+  if (el._src === src) return;
+  if (hls) { hls.destroy(); hls = null; }
+  el._src = src;
+  if (!src) return;
+  if (window.Hls && Hls.isSupported()) {
+    hls = new Hls({ liveSyncDurationCount: 3 });
+    hls.loadSource(src); hls.attachMedia(el);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => el.play().catch(() => {}));
+    hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) { el._src = null; setTimeout(() => play(src), 3000); } });
+  } else { el.src = src; el.play().catch(() => {}); }
+}
+function pickStream() {
+  const stream = status.stream === null ? null : base + (status.stream || "out/index.m3u8");
+  const cmp = status.compare ? base + status.compare : null;
+  play($("sbs").checked && cmp ? cmp : (stream || cmp));
+}
+$("sbs").onchange = pickStream;
+async function loadStatus() { try { status = await (await fetch(base + "status.json", { cache: "no-store" })).json(); pickStream(); } catch (e) {} }
+
+// ---------------------------------------------------------------- marking
+let frames = [], cur = null, img = new Image(), box = null, drag = null;
+function playingDate() {
+  const el = $("vid");
+  if (hls && hls.playingDate) return hls.playingDate.getTime();
+  if (el.getStartDate && !isNaN(el.getStartDate().getTime())) return el.getStartDate().getTime() + el.currentTime * 1000;
+  return null;
+}
+$("markBtn").onclick = async () => {
+  $("vid").pause();
+  const at = playingDate();
+  $("markCard").classList.remove("hidden");
+  $("markMsg").textContent = "Loading frames…";
+  try {
+    const r = await api("frames?span=8" + (at ? "&at=" + at : ""));
+    frames = r.frames;
+    $("strip").innerHTML = frames.map(f => `<img data-id="${f.id}" alt="">`).join("");
+    $("strip").querySelectorAll("img").forEach(im => im.onclick = () => select(+im.dataset.id));
+    if (r.center) await select(r.center); else $("markMsg").textContent = "No frames buffered yet.";
+    // images need the password header too, so they are fetched as blobs, a few at a time
+    const ims = [...$("strip").querySelectorAll("img")];
+    const centre = ims.findIndex(im => +im.dataset.id === r.center);
+    ims.sort((a, b) => Math.abs(ims.indexOf(a) - centre) - Math.abs(ims.indexOf(b) - centre));
+    await pool(ims.map(im => () => loadImg(im, "snap/" + im.dataset.id + "_t.jpg")), 4);
+    const sel = $("strip").querySelector("img.sel"); if (sel) sel.scrollIntoView({ block: "nearest", inline: "center" });
+  } catch (e) { $("markMsg").textContent = "Could not load frames: " + e.message; }
+};
+const blobs = new Map();
+async function fetchBlob(path, tries = 3) {
+  for (let i = 0; ; i++) {
+    try {
+      const r = await fetch(base + "api/" + path, { headers: { "X-Operator-Token": token } });
+      if (!r.ok) return null;
+      return URL.createObjectURL(await r.blob());
+    } catch (e) {                      // a dropped connection: try again shortly
+      if (i + 1 >= tries) return null;
+      await new Promise(res => setTimeout(res, 300 * (i + 1)));
+    }
+  }
+}
+async function loadImg(el, path) {
+  if (!blobs.has(path)) blobs.set(path, fetchBlob(path));
+  const url = await blobs.get(path);
+  if (url) el.src = url; else blobs.delete(path);
+}
+async function pool(tasks, n) {           // run async tasks n at a time
+  const run = async () => { while (tasks.length) await tasks.shift()(); };
+  await Promise.all(Array.from({ length: n }, run));
+}
+async function select(id) {
+  cur = frames.find(f => f.id === id); box = null; updateButtons();
+  $("strip").querySelectorAll("img").forEach(im => im.classList.toggle("sel", +im.dataset.id === id));
+  $("markMsg").textContent = "";
+  const url = await fetchBlob("snap/" + id + ".jpg");
+  if (!url) { $("markMsg").textContent = "Could not load that frame (it may have left the buffer): pick another."; return; }
+  await new Promise(res => { img = new Image(); img.onload = () => { draw(); res(); }; img.onerror = res; img.src = url; });
+}
+function draw() {
+  const cv = $("cv");
+  if (!img.naturalWidth) return;
+  cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+  const g = cv.getContext("2d");
+  g.drawImage(img, 0, 0);
+  if (box) {
+    const [x0, y0, x1, y1] = norm(box);
+    g.fillStyle = "rgba(76,141,255,.18)"; g.fillRect(x0, y0, x1 - x0, y1 - y0);
+    g.lineWidth = Math.max(2, cv.width / 480); g.strokeStyle = "#4c8dff"; g.strokeRect(x0, y0, x1 - x0, y1 - y0);
+  }
+}
+function norm(b) { return [Math.min(b[0], b[2]), Math.min(b[1], b[3]), Math.max(b[0], b[2]), Math.max(b[1], b[3])]; }
+function pos(e) {
+  const cv = $("cv"), r = cv.getBoundingClientRect();
+  return [(e.clientX - r.left) * cv.width / r.width, (e.clientY - r.top) * cv.height / r.height];
+}
+$("cv").onpointerdown = (e) => { if (!cur) return; $("cv").setPointerCapture(e.pointerId); const p = pos(e); drag = true; box = [p[0], p[1], p[0], p[1]]; draw(); };
+$("cv").onpointermove = (e) => { if (!drag) return; const p = pos(e); box[2] = p[0]; box[3] = p[1]; draw(); };
+$("cv").onpointerup = () => { drag = false; updateButtons(); };
+function updateButtons() {
+  const ok = cur && box && Math.abs(box[2] - box[0]) >= 8 && Math.abs(box[3] - box[1]) >= 6;
+  $("markHide").disabled = $("markKeep").disabled = !ok;
+}
+async function submitMark(action) {
+  $("markHide").disabled = $("markKeep").disabled = true;
+  $("markMsg").textContent = "Reading the logo…";
+  try {
+    const r = await api("mark", { snap: cur.id, box: norm(box), action, name: $("markName").value.trim() });
+    const b = r.brand;
+    const how = action === "hide" ? (r.matched ? `, recognised ${r.matched}` : "") : "";
+    $("markMsg").textContent = `${action === "hide" ? "Hiding" : "Keeping"} “${b.name}”${how}. ` +
+      (r.read.length ? `Read on it: ${r.read.map(x => x[0]).join(", ")}.` : "No text could be read on it.");
+    toast(`${action === "hide" ? "Hidden from now on" : "Kept from now on"}: ${b.name}`);
+    $("markName").value = ""; box = null; draw();
+    refresh();
+  } catch (e) { $("markMsg").textContent = "Failed: " + e.message; updateButtons(); }
+}
+$("markHide").onclick = () => submitMark("hide");
+$("markKeep").onclick = () => submitMark("keep");
+$("backLive").onclick = () => {
+  $("markCard").classList.add("hidden");
+  const el = $("vid");
+  if (hls && hls.liveSyncPosition) el.currentTime = hls.liveSyncPosition;
+  el.play().catch(() => {});
+};
+
+// ---------------------------------------------------------------- side panels
+function renderReview() {
+  const items = state.review || [];
+  $("revCount").textContent = items.length ? `(${items.length})` : "";
+  $("review").innerHTML = items.length ? items.map(it => `
+    <div class="item" data-id="${esc(it.id)}">
+      <div class="row" style="justify-content:space-between"><b>${esc(it.text)}</b>
+        <span class="row">${it.hint ? '<span class="tag hint">looks like betting</span>' : ""}<span class="tag">seen ${it.count}×</span></span></div>
+      ${it.crop ? `<img data-src="file/${esc(it.crop)}" alt="">` : ""}
+      <div class="row"><button class="hide" data-a="hide">Hide</button><button class="keep" data-a="keep">Keep</button>
+        <button data-a="ignore" title="Not a sponsor (score graphics, venue text…)">Not a sponsor</button></div>
+    </div>`).join("") : '<p class="muted">Nothing new right now.</p>';
+  $("review").querySelectorAll("img[data-src]").forEach(im => loadImg(im, im.dataset.src));
+  $("review").querySelectorAll("button[data-a]").forEach(bt => bt.onclick = async () => {
+    const id = bt.closest(".item").dataset.id;
+    try { const r = await api("review", { id, action: bt.dataset.a }); toast(bt.dataset.a === "ignore" ? `Ignored “${r.ignored}”` : `${bt.dataset.a === "hide" ? "Hiding" : "Keeping"} “${r.brand.name}” from now on`); refresh(); }
+    catch (e) { toast("Failed: " + e.message); }
+  });
+}
+function renderBrands() {
+  const bs = (state.library && state.library.brands) || [];
+  $("brands").innerHTML = bs.length ? bs.map(b => `
+    <div class="item" data-id="${esc(b.id)}">
+      <div class="row" style="justify-content:space-between"><b>${esc(b.name)}</b><span class="tag ${b.action}">${b.action}</span></div>
+      <div class="muted">reads: ${b.aliases.length ? b.aliases.map(esc).join(", ") : "—"}${b.picture ? " · matched by picture" : ""} · ${b.examples.length} example(s)</div>
+      <div class="row">
+        <button data-a="${b.action === "hide" ? "keep" : "hide"}">${b.action === "hide" ? "Keep instead" : "Hide instead"}</button>
+        ${b.action === "hide" ? `<button data-a="picture">${b.picture ? "Stop picture matching" : "Also match by picture"}</button>` : ""}
+        <button data-a="remove">Remove</button>
+      </div>
+    </div>`).join("") : '<p class="muted">No brands added yet.</p>';
+  $("brands").querySelectorAll("button[data-a]").forEach(bt => bt.onclick = async () => {
+    const it = bt.closest(".item"), id = it.dataset.id, a = bt.dataset.a;
+    const b = bs.find(x => x.id === id);
+    if (a === "remove" && !confirm(`Remove “${b.name}” from the list?`)) return;
+    const body = a === "remove" ? { id, remove: true } : a === "picture" ? { id, picture: !b.picture } : { id, action: a };
+    try { await api("brand", body); refresh(); } catch (e) { toast("Failed: " + e.message); }
+  });
+}
+async function addByName(action) {
+  const name = $("newName").value.trim();
+  if (!name) return;
+  try { const r = await api("brand", { name, action }); $("newName").value = ""; toast(`${action === "hide" ? "Hiding" : "Keeping"} “${r.brand.name}” from now on`); refresh(); }
+  catch (e) { toast("Failed: " + e.message); }
+}
+$("newHide").onclick = () => addByName("hide");
+$("newKeep").onclick = () => addByName("keep");
+$("newName").onkeydown = (e) => { if (e.key === "Enter") addByName("hide"); };
+
+function renderLearning() {
+  const s = state.samples || {}, rec = state.recordings || {}, m = state.models || {}, eng = state.engine || {}, job = state.job || {};
+  const by = Object.entries(s.by_source || {}).map(([k, v]) => `${k} ${v}`).join(", ");
+  const scan = eng.scan ? `${eng.scan.scans} scans, ${Math.round(eng.scan.ms)} ms each` : "off";
+  $("learnKv").innerHTML = [
+    ["Training frames", `${s.total || 0}${by ? ` (${by})` : ""}`],
+    ["Original recordings", `${rec.files || 0} files, ${rec.gb || 0} GB`],
+    ["Brand scan", scan],
+    ["Boards on screen", eng.tracks !== undefined ? `${eng.tracks} tracked, ${eng.hidden} hidden, ${eng.from_scan} found by the scan` : "—"],
+    ["Model in use", m.current || "—"],
+  ].map(([k, v]) => `<span>${esc(k)}</span><span>${esc(v)}</span>`).join("");
+  $("modelBadge").textContent = m.current ? `model: ${m.current}` : "";
+  const running = job.running;
+  $("trainBtn").textContent = running ? "Stop training" : "Train a new model now";
+  const st = job.state || {};
+  const epoch = st.stage === "train" && st.epoch ? ` (epoch ${st.epoch}/${(st.detail || {}).epochs || "?"})` : "";
+  $("trainNote").textContent = running ? `running: ${st.stage || "starting"}${epoch}`
+    : (st.result ? `last run: ${st.result}` : "Uses the GPU for 1–3 h; best when no match is live.");
+  $("jobLog").classList.toggle("hidden", !(job.log && job.log.length));
+  $("jobLog").textContent = (job.log || []).join("\n");
+  const vs = m.versions || [];
+  $("models").innerHTML = (vs.length ? vs.slice().reverse().map(v => `
+    <div class="item" data-v="${esc(v.version)}"><div class="row" style="justify-content:space-between"><b>${esc(v.version)}</b>
+      <span class="tag ${v.passed ? "keep" : "hide"}">${v.passed ? "passed the test" : "did not pass the test"}</span></div>
+      <div class="muted">${esc(v.verdict || "")}</div>
+      <div class="row"><button data-a="use" ${m.current === v.version ? "disabled" : ""}>${m.current === v.version ? "In use" : "Use this model"}</button></div></div>`).join("") : "")
+    + (m.current && m.current !== "original" ? `<div class="row"><button data-a="orig">Back to the original model</button></div>` : "");
+  $("models").querySelectorAll("button[data-a]").forEach(bt => bt.onclick = async () => {
+    const v = bt.dataset.a === "orig" ? "original" : bt.closest(".item").dataset.v;
+    if (!confirm(`Switch the live board model to ${v}?`)) return;
+    try { const r = await api("model", { version: v }); toast(r.switching_now ? `Switching to ${r.current} now` : `${r.current} will be used from the next restart`); refresh(); }
+    catch (e) { toast("Failed: " + e.message); }
+  });
+}
+$("trainBtn").onclick = async () => {
+  const running = state && state.job && state.job.running;
+  if (!running && !confirm("Start training a new model on the GPU? If a match is live, the stream may slow down while it runs.")) return;
+  try { await api("train", { action: running ? "stop" : "start" }); refresh(); } catch (e) { toast("Failed: " + e.message); }
+};
+
+async function refresh() {
+  state = await api("state");
+  $("login").classList.add("hidden"); $("app").classList.remove("hidden");
+  renderReview(); renderBrands(); renderLearning();
+}
+if (!token) showLogin(); else refresh().catch(() => {});
+loadStatus(); setInterval(loadStatus, 10000);
+setInterval(() => { if (token && !document.hidden) refresh().catch(() => {}); }, 4000);
+</script>
+</body>
+</html>

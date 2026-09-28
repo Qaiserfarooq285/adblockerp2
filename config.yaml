@@ -529,5 +529,22 @@ live:
   engine:
     det_interval: 2        # detector on every 2nd frame; the homography carries
                            # boards in between, so this costs no stability
-    delay_frames: 15       # 0.5 s look-ahead at 30 fps (see render_engine.py)
+    delay_frames: 36       # 1.2 s look-ahead at 30 fps (see render_engine.py): long
+    backfill_frames: 36    # enough that a brand the scan reads ~1 s into a shot is
+                           # still painted from the shot's first frame
     ocr_async: 1           # brand OCR off the frame loop
+  learn:                   # teaching it new brands: operator page + retraining (README)
+    enabled: true
+    dir: ""                # "" = LEARN_DIR, else /workspace/learning (the RunPod volume)
+    operator_token: ""     # the operator page's password (or OPERATOR_TOKEN); "" = no page
+    scan: true             # read every board ~1/s, so a brand in the Brand Library is
+                           # hidden at once, before the model has learned it
+    scan_threads: 2
+    record_original: true  # keep the original feed to retrain from (stream copy, about
+    original_max_gb: 15    # 1.5 GB/h for Karo); the oldest files go beyond this size
+    samples: true          # save training frames automatically: boards the model
+                           # missed, boards it flagged wrongly, and what it gets right
+    snapshot_seconds: 90   # how far back the operator can pick a frame to mark
+    auto_train: idle       # off | idle (the input has been down idle_minutes, i.e. the
+    idle_minutes: 20       # match is over) | daily@04:00 (UTC, shares the GPU if live)
+    min_new_samples: 30    # ...and at least this many new training frames

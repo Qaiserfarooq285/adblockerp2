@@ -113,9 +113,20 @@ class BoardTrack:
         self.fade_from: int | None = None  # fade out after this frame (lost boards)
         # brand verdict, owned by the engine's OCR scheduler
         self.verdict = "pending"           # pending | bet | neg | unknown
+        self.brand: str | None = None      # Brand Library id behind the verdict
+        self.ocr_texts: list[str] = []     # what OCR last read on this board
         self.ocr_attempts = 0
         self.ocr_next = frame_idx
         self.ocr_pending = False
+        # who found it: "model" (a detection) or "scan" / "picture" /
+        # "operator" (BoardTracker.inject), and the model's class evidence:
+        # votes[0] betting board, votes[1] any other ad board (2-class models)
+        self.source = "model"
+        self.votes = [0.0, 0.0]
+        self.last_model_frame: int | None = None
+        # an injected board is held this long without detector support
+        self.anchor_until: int | None = None
+        self.scan_misses = 0               # scans in a row that looked and did not see it
         # delayed-render bookkeeping
         self.history: dict[int, np.ndarray] = {frame_idx: self.quad.copy()}
         self.det_frames: set[int] = {frame_idx}
@@ -125,6 +136,16 @@ class BoardTrack:
     @property
     def alive(self) -> bool:
         return self.state != "dead"
+
+    def vote(self, cls: int, conf: float, frame_idx: int) -> None:
+        self.votes[1 if cls else 0] += float(conf)
+        self.last_model_frame = frame_idx
+
+    @property
+    def model_bet(self) -> bool:
+        """The model itself calls this a betting board (always, with a
+        single-class model; by majority with a two-class one)."""
+        return self.last_model_frame is not None and self.votes[0] >= self.votes[1]
 
     def correct(self, det: np.ndarray, conf: float, frame_idx: int,
                 w: int, h: int, cfg: TrackerConfig) -> None:
@@ -342,9 +363,12 @@ class BoardTracker:
     def _update(self, frame_idx: int, motion: Motion, dets) -> None:
         cfg = self.cfg
         live = [t for t in self.tracks if t.alive]
+        # (quad, conf) or (quad, conf, cls): cls 0 = betting board, 1 = any
+        # other ad board (two-class models); single-class models give 0
+        dets = [(d[0], d[1], int(d[2]) if len(d) > 2 else 0) for d in dets]
         pairs = []
         for i, t in enumerate(live):
-            for j, (dq, _) in enumerate(dets):
+            for j, (dq, _, _) in enumerate(dets):
                 iou = convex_iou(t.quad, dq)
                 if iou >= cfg.match_iou:
                     pairs.append((iou, i, j))
@@ -363,7 +387,7 @@ class BoardTracker:
         for i, t in enumerate(live):
             if i in t_of:
                 continue
-            for j, (dq, _) in enumerate(dets):
+            for j, (dq, _, _) in enumerate(dets):
                 if j in d_of and containment(t.quad, dq) >= cfg.absorb_frac:
                     swallowed.setdefault(j, []).append(i)
                     break
@@ -374,6 +398,7 @@ class BoardTracker:
                 self._kill(live[i], frame_idx - 1, "merged")
             keeper.resync(dets[j][0], frame_idx, cfg)
             keeper.conf = 0.7 * keeper.conf + 0.3 * float(dets[j][1])
+            keeper.vote(dets[j][2], dets[j][1], frame_idx)
 
         for i, t in enumerate(live):
             if not t.alive:
@@ -381,14 +406,22 @@ class BoardTracker:
             if i in t_of:
                 j = t_of[i]
                 if j not in swallowed:
-                    dq, dc = dets[j]
+                    dq, dc, dk = dets[j]
                     t.correct(dq, dc, frame_idx, self.w, self.h, cfg)
+                    t.vote(dk, dc, frame_idx)
             else:
+                if t.anchor_until is not None:
+                    if frame_idx <= t.anchor_until:
+                        continue                # held by the brand scan
+                    # the scan stopped confirming it: let it end from here,
+                    # fading, instead of from its last confirmation long ago
+                    t.last_det_frame = max(t.last_det_frame, t.anchor_until)
+                    t.anchor_until = None
                 t.runs_since_hit += 1
                 limit = cfg.coast_short if self._plainly_visible(t, motion) else cfg.coast_long
                 t.miss_budget += 1.0 / max(1, limit)
 
-        for j, (dq, dc) in enumerate(dets):
+        for j, (dq, dc, dk) in enumerate(dets):
             if j in d_of or dc < cfg.birth_conf:
                 continue
             # A fragment of a board we already track (the detector split it
@@ -396,8 +429,74 @@ class BoardTracker:
             if any(containment(dq, t.quad) >= cfg.absorb_frac for t in self.tracks if t.alive):
                 continue
             self._next += 1
-            self.tracks.append(BoardTrack(self._next, dq, dc, frame_idx, cfg))
+            t = BoardTrack(self._next, dq, dc, frame_idx, cfg)
+            t.vote(dk, dc, frame_idx)
+            self.tracks.append(t)
             self.events["born"] += 1
+
+    def inject(self, frame_idx: int, quad: np.ndarray, verdict: str, brand: str | None,
+               anchor_frames: int, source: str, conf: float = 0.9) -> BoardTrack | None:
+        """A board named by the brand scan or marked by the operator.
+
+        It is not a detection -- the model did not see it -- so it never
+        counts as a detector hit.  Overlapping an existing board, it names
+        that board (the model found it, the scan read it); otherwise a
+        'bet' starts a confirmed board of its own.  A board only the scan
+        sees is held for `anchor_frames` whatever the detector says, and the
+        next scan renews the hold or lets it lapse; a board the model tracks
+        keeps the model's own coasting rules.  Call after step() for the
+        same frame.
+        """
+        cfg = self.cfg
+        q = np.asarray(quad, np.float32).reshape(4, 2)
+        if not is_convex(q) or polygon_area(q) < 20:
+            return None
+        best, best_score = None, 0.0
+        for t in self.tracks:
+            if not t.alive:
+                continue
+            iou = convex_iou(t.quad, q)
+            cover = max(containment(q, t.quad), containment(t.quad, q))
+            if iou >= cfg.match_iou or cover >= cfg.absorb_frac:
+                score = max(iou, 0.8 * cover)
+                if score > best_score:
+                    best, best_score = t, score
+        if best is not None:
+            t = best
+            if verdict in ("bet", "neg"):
+                t.verdict = verdict
+            if brand:
+                t.brand = brand
+            if verdict == "bet":
+                if t.state == "tentative":           # named: no need to wait for more hits
+                    t.state = "confirmed"
+                    t.confirmed_frame = frame_idx
+                model_led = (t.last_model_frame is not None and
+                             frame_idx - t.last_model_frame <= 2 * cfg.coast_short)
+                if not model_led:
+                    # Only the scan sees this board: its reading is the best
+                    # evidence of where the board is, and nothing else keeps
+                    # it alive between readings.  A board the model does see
+                    # keeps the model's own coasting rules.
+                    t.anchor_until = max(t.anchor_until or -1, frame_idx + int(anchor_frames))
+                    t.scan_misses = 0
+                    t.correct(q, conf, frame_idx, self.w, self.h, cfg)
+                    t.history[frame_idx] = t.quad.copy()
+            elif verdict == "neg":
+                t.anchor_until = None
+            self.events[f"named_{verdict}"] += 1
+            return t
+        if verdict != "bet" or visible_fraction(q, self.w, self.h) < cfg.min_visible:
+            return None
+        self._next += 1
+        t = BoardTrack(self._next, q, conf, frame_idx, cfg)
+        t.state = "confirmed"
+        t.confirmed_frame = frame_idx
+        t.verdict, t.brand, t.source = "bet", brand, source
+        t.anchor_until = frame_idx + int(anchor_frames)
+        self.tracks.append(t)
+        self.events["injected"] += 1
+        return t
 
     def _lifecycle(self, frame_idx: int) -> None:
         cfg = self.cfg
@@ -452,8 +551,15 @@ class BoardTracker:
         rank = {"bet": 3, "neg": 2, "unknown": 1, "pending": 0}
         if rank[drop.verdict] > rank[keep.verdict]:
             keep.verdict = drop.verdict
+            keep.brand = drop.brand or keep.brand
+            keep.ocr_texts = drop.ocr_texts or keep.ocr_texts
         if keep.first_drawn is None:
             keep.first_drawn = drop.first_drawn
+        keep.votes = [keep.votes[0] + drop.votes[0], keep.votes[1] + drop.votes[1]]
+        if drop.last_model_frame is not None:
+            keep.last_model_frame = max(keep.last_model_frame or -1, drop.last_model_frame)
+        if drop.anchor_until is not None:
+            keep.anchor_until = max(keep.anchor_until or -1, drop.anchor_until)
 
     def _kill(self, t: BoardTrack, end_frame: int, reason: str) -> None:
         if not t.alive:

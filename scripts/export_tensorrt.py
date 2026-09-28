@@ -35,7 +35,8 @@ def export(weights: str, imgsz, dynamic: bool, out_dir: Path, workspace: float) 
         print(f"[trt] {dst} is current; skipping")
         return dst
     print(f"[trt] exporting {weights} imgsz={imgsz} dynamic={dynamic} (several minutes)...")
-    built = Path(YOLO(weights).export(format="engine", half=True, imgsz=imgsz, dynamic=dynamic,
+    from render_engine import precision                 # quantize=16 on Ultralytics >= 8.4
+    built = Path(YOLO(weights).export(format="engine", **precision(True), imgsz=imgsz, dynamic=dynamic,
                                       batch=1, workspace=workspace, device=0, simplify=True))
     out_dir.mkdir(parents=True, exist_ok=True)
     shutil.move(str(built), dst)

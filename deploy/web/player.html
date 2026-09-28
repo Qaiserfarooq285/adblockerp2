@@ -34,6 +34,7 @@
 <body>
 <header>
   <h1><span id="dot" class="dot"></span>Betting Ad Blocker — live</h1>
+  <a id="opLink" href="operator.html" hidden style="color:var(--accent);margin-left:auto;margin-right:8px">Operator</a>
   <div class="seg" role="group" aria-label="View">
     <button id="bProc" aria-pressed="true">Processed</button>
     <button id="bSide" aria-pressed="false">Side by side</button>
@@ -93,6 +94,7 @@
       const r = await fetch(base + "status.json", { cache: "no-store" });
       status = await r.json();
       document.getElementById("dot").classList.toggle("ok", status.fps_out > 0);
+      document.getElementById("opLink").hidden = !status.operator;
       const rec = status.recording
         ? `<div class="s"><b><a href="${base + status.recording}" download>Download</a></b><span>recording so far (<a href="${base}recordings/">all</a>)</span></div>` : "";
       document.getElementById("stats").innerHTML = fields.map(([k, label]) =>

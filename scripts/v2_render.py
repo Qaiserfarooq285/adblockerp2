@@ -1000,8 +1000,19 @@ def process(video: Path, out_path: Path, cfg: dict, debug: bool = False,
     overlay = static_overlay_mask(video) if int(cfg["protect_overlay"]) else None
     if overlay is not None:
         print(f"[render] static broadcast overlay: {100 * overlay.mean() / 255:.2f}% of frame")
+    library = scanner = None
+    if cfg.get("brands") or int(cfg.get("scan", 0)):
+        from brand_library import BrandLibrary
+        library = BrandLibrary(cfg["brands"] or None)
+        print(f"[render] brand library: {len(library.brands)} operator brands"
+              + (f" from {cfg['brands']}" if cfg["brands"] else ""))
+    if int(cfg.get("scan", 0)):
+        from brand_scan import BrandScanner
+        root = Path(cfg["brands"]).parent if cfg["brands"] else None
+        scanner = BrandScanner(library, {"threads": 4}, learn_root=root, async_mode=False)
     engine = AdBlockEngine(cfg, w, h, overlay_mask=overlay, live=False,
-                           debug=debug, panel_log=panel_log, fps=fps)
+                           debug=debug, panel_log=panel_log, fps=fps,
+                           library=library, scanner=scanner)
 
     tmp = out_path.with_suffix(".tmp.mp4")
     tmp.parent.mkdir(parents=True, exist_ok=True)
@@ -1232,6 +1243,13 @@ DEFAULTS = dict(
     ocr_async=0,             # files: inline (deterministic); live: 1
     ocr_wait=8,              # frames a new board waits for its OCR verdict
     ocr_retry=30, ocr_recheck=300, ocr_max_attempts=6,
+
+    # ---- Brand Library + brand scan (live: live_stream.py's `learn:` section) ----
+    brands="",               # files: follow this brands.json (e.g. learning/brands.json)
+    scan=0,                  # files: also read every board ~1/s to hide brands the model misses
+    scan_every=30,           # frames between brand scans; a camera cut triggers one at once
+    scan_anchor=90,          # frames a scanned board is held without being read again
+    hide_unknown=0,          # two-class models: also hide adverts whose brand is unknown
 
     # ---- legacy tracker only ----
     track_iou=0.30, min_hits=1,
